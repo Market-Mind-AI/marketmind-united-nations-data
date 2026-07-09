@@ -40,12 +40,16 @@ from app.schemas.responses import (
 from app.utils.normalization import normalize_observations
 from app.utils.time import elapsed_ms, utc_now
 
-# Mirrors what was live in the indicator catalog as of 2026-07-08 (until
-# then, entries only ever got there via a manual POST /indicators/catalog
-# call, with no code-level record of them — silently lost on a fresh
-# volume without this). un_indicator_id values confirmed live against the
-# real UN Population Data Portal API (seen in this project's own ingestion
-# logs, GET .../indicators/{id}/... calls), not guessed.
+# un_indicator_id values confirmed 2026-07-09 against the real UN Population
+# Data Portal API (GET /remote/indicators), NOT guessed — the IDs matter:
+#   49 = "Total population by sex"      (TOTAL_POPULATION)
+#   67 = "Median age of population"     (MEDIAN_AGE)
+#   65 = "Total net-migration"          (NET_MIGRATION — absolute count; the
+#        Net Migration Rate Score divides this by TOTAL_POPULATION itself)
+#   51 = "Rate of population change"    (POPULATION_GROWTH — annual %)
+# An earlier draft wrongly mapped NET_MIGRATION to 51 (population change
+# rate), which produced absurd net-migration-rate values (~1e-6) and left
+# POPULATION_GROWTH unseeded entirely — both found in the live /analyze test.
 SEED_INDICATORS: list[IndicatorCatalogItem] = [
     IndicatorCatalogItem(
         indicator_code="TOTAL_POPULATION",
@@ -68,9 +72,18 @@ SEED_INDICATORS: list[IndicatorCatalogItem] = [
     IndicatorCatalogItem(
         indicator_code="NET_MIGRATION",
         indicator_name="Net Migration",
-        description="Net number of migrants, including both refugees and other migrants.",
+        description="Total net number of migrants (in-migrants minus out-migrants), absolute count.",
         category=IndicatorCategory.MIGRATION,
         expected_unit="persons",
+        marketmind_dimension=MarketMindDimension.DEMOGRAPHIC_READINESS,
+        un_indicator_id=65,
+    ),
+    IndicatorCatalogItem(
+        indicator_code="POPULATION_GROWTH",
+        indicator_name="Population Growth Rate",
+        description="Annual rate of population change (%).",
+        category=IndicatorCategory.POPULATION_GROWTH,
+        expected_unit="percentage",
         marketmind_dimension=MarketMindDimension.DEMOGRAPHIC_READINESS,
         un_indicator_id=51,
     ),
