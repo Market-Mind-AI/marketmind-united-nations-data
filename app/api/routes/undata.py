@@ -52,7 +52,9 @@ def get_remote_locations(service: UNDataService = Depends(get_undata_service)) -
     summary="Register Dataflows",
     description="Register UN data sources/dataflows relevant for MarketMind.",
 )
-def register_dataflows(request: RegisterDataflowsRequest, service: UNDataService = Depends(get_undata_service)) -> StandardResponse:
+def register_dataflows(
+    request: RegisterDataflowsRequest, service: UNDataService = Depends(get_undata_service)
+) -> StandardResponse:
     return service.register_dataflows(request)
 
 
@@ -72,7 +74,9 @@ def list_dataflows(service: UNDataService = Depends(get_undata_service)) -> Stan
     summary="Register Datastructures",
     description="Register dimensions and codelists for a dataflow.",
 )
-def register_datastructures(request: RegisterDatastructuresRequest, service: UNDataService = Depends(get_undata_service)) -> StandardResponse:
+def register_datastructures(
+    request: RegisterDatastructuresRequest, service: UNDataService = Depends(get_undata_service)
+) -> StandardResponse:
     return service.register_datastructures(request)
 
 
@@ -82,7 +86,9 @@ def register_datastructures(request: RegisterDatastructuresRequest, service: UND
     summary="List Datastructures",
     description="List registered datastructures. Optionally filter by dataflow_id.",
 )
-def list_datastructures(dataflow_id: str | None = None, service: UNDataService = Depends(get_undata_service)) -> StandardResponse:
+def list_datastructures(
+    dataflow_id: str | None = None, service: UNDataService = Depends(get_undata_service)
+) -> StandardResponse:
     return service.list_datastructures(dataflow_id)
 
 
@@ -92,7 +98,9 @@ def list_datastructures(dataflow_id: str | None = None, service: UNDataService =
     summary="Register Indicators Catalog",
     description="Create or update the internal catalog of UN indicators. Each indicator must include un_indicator_id (the numeric ID from the UN Population Data Portal API).",
 )
-def register_indicators_catalog(request: RegisterIndicatorsCatalogRequest, service: UNDataService = Depends(get_undata_service)) -> StandardResponse:
+def register_indicators_catalog(
+    request: RegisterIndicatorsCatalogRequest, service: UNDataService = Depends(get_undata_service)
+) -> StandardResponse:
     return service.register_indicators(request)
 
 
@@ -107,12 +115,24 @@ def list_indicators_catalog(service: UNDataService = Depends(get_undata_service)
 
 
 @router.post(
+    "/indicators/catalog/seed",
+    response_model=StandardResponse,
+    summary="Seed indicator catalog",
+    description="Seeds the internal indicator catalog with the default MarketMind indicators (idempotent).",
+)
+def seed_catalog(service: UNDataService = Depends(get_undata_service)) -> StandardResponse:
+    return service.seed_catalog()
+
+
+@router.post(
     "/indicators/collect",
     response_model=StandardResponse,
     summary="Collect Indicators",
     description="Collect indicators from the UN Population Data Portal API for a given country/location and year range. Each indicator must have un_indicator_id configured in the catalog.",
 )
-def collect_indicators(request: CollectIndicatorsRequest, service: UNDataService = Depends(get_undata_service)) -> StandardResponse:
+def collect_indicators(
+    request: CollectIndicatorsRequest, service: UNDataService = Depends(get_undata_service)
+) -> StandardResponse:
     try:
         return service.collect_indicators(request)
     except IndicatorNotConfiguredError as e:

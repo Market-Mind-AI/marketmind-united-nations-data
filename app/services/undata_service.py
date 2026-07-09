@@ -12,7 +12,7 @@ from app.core.exceptions import (
     UNDataBaseException,
 )
 from app.core.logging import logger
-from app.domain.enums import IngestionStatus, RequestMethod
+from app.domain.enums import IndicatorCategory, IngestionStatus, MarketMindDimension, RequestMethod
 from app.repositories.ingestion_run_repository import IngestionRunRepository
 from app.repositories.raw_api_response_repository import RawApiResponseRepository
 from app.repositories.undata_dataflow_repository import UNDataDataflowRepository
@@ -22,6 +22,7 @@ from app.repositories.undata_observation_repository import UNDataObservationRepo
 from app.repositories.undata_request_repository import UNDataRequestRepository
 from app.schemas.requests import (
     CollectIndicatorsRequest,
+    IndicatorCatalogItem,
     RegisterDataflowsRequest,
     RegisterDatastructuresRequest,
     RegisterIndicatorsCatalogRequest,
@@ -38,6 +39,42 @@ from app.schemas.responses import (
 )
 from app.utils.normalization import normalize_observations
 from app.utils.time import elapsed_ms, utc_now
+
+# Mirrors what was live in the indicator catalog as of 2026-07-08 (until
+# then, entries only ever got there via a manual POST /indicators/catalog
+# call, with no code-level record of them — silently lost on a fresh
+# volume without this). un_indicator_id values confirmed live against the
+# real UN Population Data Portal API (seen in this project's own ingestion
+# logs, GET .../indicators/{id}/... calls), not guessed.
+SEED_INDICATORS: list[IndicatorCatalogItem] = [
+    IndicatorCatalogItem(
+        indicator_code="TOTAL_POPULATION",
+        indicator_name="Total Population",
+        description="Total resident population by country and year.",
+        category=IndicatorCategory.TOTAL_POPULATION,
+        expected_unit="persons",
+        marketmind_dimension=MarketMindDimension.MARKET_POPULATION_POTENTIAL,
+        un_indicator_id=49,
+    ),
+    IndicatorCatalogItem(
+        indicator_code="MEDIAN_AGE",
+        indicator_name="Median Age",
+        description="Median age of the population, both sexes, total age group.",
+        category=IndicatorCategory.POPULATION_BY_AGE,
+        expected_unit="years",
+        marketmind_dimension=MarketMindDimension.TARGET_AGE_FIT,
+        un_indicator_id=67,
+    ),
+    IndicatorCatalogItem(
+        indicator_code="NET_MIGRATION",
+        indicator_name="Net Migration",
+        description="Net number of migrants, including both refugees and other migrants.",
+        category=IndicatorCategory.MIGRATION,
+        expected_unit="persons",
+        marketmind_dimension=MarketMindDimension.DEMOGRAPHIC_READINESS,
+        un_indicator_id=51,
+    ),
+]
 
 
 class UNDataService:
@@ -86,7 +123,9 @@ class UNDataService:
         self._session.commit()
         return StandardResponse(
             request=request.model_dump(),
-            metadata=MetadataResponse(endpoint="dataflows_register", records=len(created_ids), stored=True, status="success"),
+            metadata=MetadataResponse(
+                endpoint="dataflows_register", records=len(created_ids), stored=True, status="success"
+            ),
             data={"dataflow_ids": created_ids},
         )
 
@@ -95,29 +134,94 @@ class UNDataService:
         return StandardResponse(
             request={},
             metadata=MetadataResponse(endpoint="dataflows", records=len(dataflows), status="success"),
-            data={"dataflows": [DataflowResponse(id=d.id, agency_id=d.agency_id, dataflow_id=d.dataflow_id, name=d.name, description=d.description, version=d.version, created_at=d.created_at).model_dump() for d in dataflows]},
+            data={
+                "dataflows": [
+                    DataflowResponse(
+                        id=d.id,
+                        agency_id=d.agency_id,
+                        dataflow_id=d.dataflow_id,
+                        name=d.name,
+                        description=d.description,
+                        version=d.version,
+                        created_at=d.created_at,
+                    ).model_dump()
+                    for d in dataflows
+                ]
+            },
         )
 
     # ── Datastructures ──
 
     def register_datastructures(self, request: RegisterDatastructuresRequest) -> StandardResponse:
-        records = self._datastructure_repo.bulk_create(dataflow_id=request.dataflow_id, dimensions=[d.model_dump() for d in request.dimensions])
+        records = self._datastructure_repo.bulk_create(
+            dataflow_id=request.dataflow_id, dimensions=[d.model_dump() for d in request.dimensions]
+        )
         self._session.commit()
         return StandardResponse(
             request=request.model_dump(),
-            metadata=MetadataResponse(endpoint="datastructures_register", records=len(records), stored=True, status="success"),
+            metadata=MetadataResponse(
+                endpoint="datastructures_register", records=len(records), stored=True, status="success"
+            ),
             data={"records_created": len(records)},
         )
 
     def list_datastructures(self, dataflow_id: str | None = None) -> StandardResponse:
-        structures = self._datastructure_repo.get_by_dataflow(dataflow_id) if dataflow_id else self._datastructure_repo.get_all()
+        structures = (
+            self._datastructure_repo.get_by_dataflow(dataflow_id) if dataflow_id else self._datastructure_repo.get_all()
+        )
         return StandardResponse(
             request={"dataflow_id": dataflow_id} if dataflow_id else {},
             metadata=MetadataResponse(endpoint="datastructures", records=len(structures), status="success"),
-            data={"datastructures": [DatastructureResponse(id=s.id, dataflow_id=s.dataflow_id, structure_id=s.structure_id, dimension_id=s.dimension_id, dimension_name=s.dimension_name, dimension_position=s.dimension_position, code_id=s.code_id, code_name=s.code_name, created_at=s.created_at).model_dump() for s in structures]},
+            data={
+                "datastructures": [
+                    DatastructureResponse(
+                        id=s.id,
+                        dataflow_id=s.dataflow_id,
+                        structure_id=s.structure_id,
+                        dimension_id=s.dimension_id,
+                        dimension_name=s.dimension_name,
+                        dimension_position=s.dimension_position,
+                        code_id=s.code_id,
+                        code_name=s.code_name,
+                        created_at=s.created_at,
+                    ).model_dump()
+                    for s in structures
+                ]
+            },
         )
 
     # ── Indicators Catalog ──
+
+    def seed_catalog(self) -> StandardResponse:
+        """Idempotent — upserts SEED_INDICATORS by indicator_code (unlike
+        register_indicators, which always inserts). Safe to call on every
+        startup, not just after a fresh volume."""
+        seeded_ids: list[str] = []
+        for item in SEED_INDICATORS:
+            indicator = self._indicator_repo.upsert(
+                indicator_code=item.indicator_code,
+                indicator_name=item.indicator_name,
+                category=item.category.value,
+                description=item.description,
+                expected_unit=item.expected_unit,
+                marketmind_dimension=item.marketmind_dimension.value if item.marketmind_dimension else None,
+                un_indicator_id=item.un_indicator_id,
+                un_location_id=item.un_location_id,
+                default_variant_id=item.default_variant_id,
+                default_age_id=item.default_age_id,
+                default_sex_id=item.default_sex_id,
+                default_category_id=item.default_category_id,
+                is_active=item.is_active,
+            )
+            seeded_ids.append(str(indicator.id))
+        self._session.commit()
+        return StandardResponse(
+            request={},
+            metadata=MetadataResponse(
+                endpoint="indicators_catalog_seed", records=len(seeded_ids), stored=True, status="success"
+            ),
+            data={"indicator_ids": seeded_ids},
+        )
 
     def register_indicators(self, request: RegisterIndicatorsCatalogRequest) -> StandardResponse:
         created_ids: list[str] = []
@@ -141,7 +245,9 @@ class UNDataService:
         self._session.commit()
         return StandardResponse(
             request=request.model_dump(),
-            metadata=MetadataResponse(endpoint="indicators_catalog", records=len(created_ids), stored=True, status="success"),
+            metadata=MetadataResponse(
+                endpoint="indicators_catalog", records=len(created_ids), stored=True, status="success"
+            ),
             data={"indicator_ids": created_ids},
         )
 
@@ -150,7 +256,28 @@ class UNDataService:
         return StandardResponse(
             request={},
             metadata=MetadataResponse(endpoint="indicators_catalog", records=len(indicators), status="success"),
-            data={"indicators": [IndicatorCatalogResponse(id=i.id, indicator_code=i.indicator_code, indicator_name=i.indicator_name, description=i.description, category=i.category, expected_unit=i.expected_unit, marketmind_dimension=i.marketmind_dimension, un_indicator_id=i.un_indicator_id, un_location_id=i.un_location_id, default_variant_id=i.default_variant_id, default_age_id=i.default_age_id, default_sex_id=i.default_sex_id, default_category_id=i.default_category_id, is_active=i.is_active, created_at=i.created_at).model_dump() for i in indicators]},
+            data={
+                "indicators": [
+                    IndicatorCatalogResponse(
+                        id=i.id,
+                        indicator_code=i.indicator_code,
+                        indicator_name=i.indicator_name,
+                        description=i.description,
+                        category=i.category,
+                        expected_unit=i.expected_unit,
+                        marketmind_dimension=i.marketmind_dimension,
+                        un_indicator_id=i.un_indicator_id,
+                        un_location_id=i.un_location_id,
+                        default_variant_id=i.default_variant_id,
+                        default_age_id=i.default_age_id,
+                        default_sex_id=i.default_sex_id,
+                        default_category_id=i.default_category_id,
+                        is_active=i.is_active,
+                        created_at=i.created_at,
+                    ).model_dump()
+                    for i in indicators
+                ]
+            },
         )
 
     # ── Collect Indicators ──
@@ -171,66 +298,137 @@ class UNDataService:
                 continue
 
             start = utc_now()
-            run = self._ingestion_repo.create(source="united_nations_data", request_payload={
-                "country": request.country, "location_id": request.location_id,
-                "indicator_code": code, "un_indicator_id": indicator.un_indicator_id,
-                "start_year": request.start_year, "end_year": request.end_year,
-            })
+            run = self._ingestion_repo.create(
+                source="united_nations_data",
+                request_payload={
+                    "country": request.country,
+                    "location_id": request.location_id,
+                    "indicator_code": code,
+                    "un_indicator_id": indicator.un_indicator_id,
+                    "start_year": request.start_year,
+                    "end_year": request.end_year,
+                },
+            )
             base_url = f"{settings.undata_api_base_url}/data/indicators/{indicator.un_indicator_id}/locations/{request.location_id}/years/..."
             undata_req = self._request_repo.create(
-                ingestion_run_id=run.id, endpoint="indicators_collect", url=base_url,
-                request_method=RequestMethod.GET, dataset_id="UN_WPP", dataflow_id="WPP2024",
-                country=request.country, indicator_code=code,
-                start_period=str(request.start_year), end_period=str(request.end_year),
-                query_params={"un_indicator_id": indicator.un_indicator_id, "location_id": request.location_id,
-                              "variant_id": indicator.default_variant_id, "age_id": indicator.default_age_id,
-                              "sex_id": indicator.default_sex_id, "category_id": indicator.default_category_id},
+                ingestion_run_id=run.id,
+                endpoint="indicators_collect",
+                url=base_url,
+                request_method=RequestMethod.GET,
+                dataset_id="UN_WPP",
+                dataflow_id="WPP2024",
+                country=request.country,
+                indicator_code=code,
+                start_period=str(request.start_year),
+                end_period=str(request.end_year),
+                query_params={
+                    "un_indicator_id": indicator.un_indicator_id,
+                    "location_id": request.location_id,
+                    "variant_id": indicator.default_variant_id,
+                    "age_id": indicator.default_age_id,
+                    "sex_id": indicator.default_sex_id,
+                    "category_id": indicator.default_category_id,
+                },
             )
 
             try:
                 data_rows, raw_rows = self._client.get_data_range(
-                    indicator_id=indicator.un_indicator_id, location_id=request.location_id,
-                    start_year=request.start_year, end_year=request.end_year,
-                    variant_id=indicator.default_variant_id, age_id=indicator.default_age_id,
-                    sex_id=indicator.default_sex_id, category_id=indicator.default_category_id,
+                    indicator_id=indicator.un_indicator_id,
+                    location_id=request.location_id,
+                    start_year=request.start_year,
+                    end_year=request.end_year,
+                    variant_id=indicator.default_variant_id,
+                    age_id=indicator.default_age_id,
+                    sex_id=indicator.default_sex_id,
+                    category_id=indicator.default_category_id,
                 )
 
                 self._raw_response_repo.create(
-                    undata_request_id=undata_req.id, endpoint="indicators_collect",
-                    request_payload={"un_indicator_id": indicator.un_indicator_id, "location_id": request.location_id, "years": f"{request.start_year}-{request.end_year}"},
-                    response_payload=raw_rows, response_text=json.dumps(raw_rows),
+                    undata_request_id=undata_req.id,
+                    endpoint="indicators_collect",
+                    request_payload={
+                        "un_indicator_id": indicator.un_indicator_id,
+                        "location_id": request.location_id,
+                        "years": f"{request.start_year}-{request.end_year}",
+                    },
+                    response_payload=raw_rows,
+                    response_text=json.dumps(raw_rows),
                 )
 
                 raw_observations = [
-                    {"country": request.country, "country_name": row.get("location", request.country),
-                     "indicator_code": code, "indicator_name": indicator.indicator_name,
-                     "time_period": str(row.get("timeLabel", "")), "value": row.get("value"),
-                     "unit": indicator.expected_unit, "frequency": "A",
-                     "attributes": {"variant": row.get("variant"), "sex": row.get("sex"), "age": row.get("ageLabel"), "source": "UN Population Division Data Portal API"}}
+                    {
+                        "country": request.country,
+                        "country_name": row.get("location", request.country),
+                        "indicator_code": code,
+                        "indicator_name": indicator.indicator_name,
+                        "time_period": str(row.get("timeLabel", "")),
+                        "value": row.get("value"),
+                        "unit": indicator.expected_unit,
+                        "frequency": "A",
+                        "attributes": {
+                            "variant": row.get("variant"),
+                            "sex": row.get("sex"),
+                            "age": row.get("ageLabel"),
+                            "source": "UN Population Division Data Portal API",
+                        },
+                    }
                     for row in data_rows
                 ]
                 observations = normalize_observations(raw_observations)
 
                 if observations:
-                    self._observation_repo.bulk_create(undata_request_id=undata_req.id, observations=observations, dataset_id="UN_WPP", dataflow_id="WPP2024")
+                    self._observation_repo.bulk_create(
+                        undata_request_id=undata_req.id,
+                        observations=observations,
+                        dataset_id="UN_WPP",
+                        dataflow_id="WPP2024",
+                    )
 
                 exec_time = elapsed_ms(start)
                 self._ingestion_repo.mark_success(run, exec_time)
                 self._session.commit()
                 run_ids.append(str(run.id))
                 request_ids.append(str(undata_req.id))
-                all_observations.extend([ObservationResponse(country=o["country"], country_name=o.get("country_name"), indicator_code=o["indicator_code"], indicator_name=o.get("indicator_name"), time_period=o["time_period"], value=o.get("value"), unit=o.get("unit"), frequency=o.get("frequency")).model_dump() for o in observations])
-                logger.info(f"endpoint=indicators_collect | ingestion_run_id={run.id} | country={request.country} | indicator={code} | records={len(observations)} | status=success")
+                all_observations.extend(
+                    [
+                        ObservationResponse(
+                            country=o["country"],
+                            country_name=o.get("country_name"),
+                            indicator_code=o["indicator_code"],
+                            indicator_name=o.get("indicator_name"),
+                            time_period=o["time_period"],
+                            value=o.get("value"),
+                            unit=o.get("unit"),
+                            frequency=o.get("frequency"),
+                        ).model_dump()
+                        for o in observations
+                    ]
+                )
+                logger.info(
+                    f"endpoint=indicators_collect | ingestion_run_id={run.id} | country={request.country} | indicator={code} | records={len(observations)} | status=success"
+                )
 
             except UNDataBaseException as e:
                 exec_time = elapsed_ms(start)
-                self._raw_response_repo.create(undata_request_id=undata_req.id, endpoint="indicators_collect", request_payload={"indicator": code}, response_payload={"error": str(e)}, response_text=str(e))
+                self._raw_response_repo.create(
+                    undata_request_id=undata_req.id,
+                    endpoint="indicators_collect",
+                    request_payload={"indicator": code},
+                    response_payload={"error": str(e)},
+                    response_text=str(e),
+                )
                 self._ingestion_repo.mark_failed(run, str(e), exec_time)
                 self._session.commit()
                 errors.append(f"Failed collecting {code}: {e}")
             except Exception as e:
                 exec_time = elapsed_ms(start)
-                self._raw_response_repo.create(undata_request_id=undata_req.id, endpoint="indicators_collect", request_payload={"indicator": code}, response_payload={"error": str(e)}, response_text=str(e))
+                self._raw_response_repo.create(
+                    undata_request_id=undata_req.id,
+                    endpoint="indicators_collect",
+                    request_payload={"indicator": code},
+                    response_payload={"error": str(e)},
+                    response_text=str(e),
+                )
                 self._ingestion_repo.mark_failed(run, str(e), exec_time)
                 self._session.commit()
                 errors.append(f"Failed collecting {code}: {e}")
@@ -241,8 +439,19 @@ class UNDataService:
         status = "success" if not errors else "partial"
         return StandardResponse(
             request=request.model_dump(),
-            metadata=MetadataResponse(endpoint="indicators_collect", records=len(all_observations), stored=True, status=status, collected_at=utc_now()),
-            data={"observations": all_observations, "errors": errors if errors else None, "ingestion_run_ids": run_ids, "undata_request_ids": request_ids},
+            metadata=MetadataResponse(
+                endpoint="indicators_collect",
+                records=len(all_observations),
+                stored=True,
+                status=status,
+                collected_at=utc_now(),
+            ),
+            data={
+                "observations": all_observations,
+                "errors": errors if errors else None,
+                "ingestion_run_ids": run_ids,
+                "undata_request_ids": request_ids,
+            },
         )
 
     # ── Lookups ──
@@ -254,9 +463,42 @@ class UNDataService:
         observations = self._observation_repo.get_by_request_id(undata_request_id)
         return StandardResponse(
             request={"undata_request_id": str(undata_request_id)},
-            metadata=MetadataResponse(endpoint="requests", records=len(observations), status="success", ingestion_run_id=req.ingestion_run_id, undata_request_id=req.id),
-            data={"request": UNDataRequestResponse(id=req.id, ingestion_run_id=req.ingestion_run_id, endpoint=req.endpoint, url=req.url, dataset_id=req.dataset_id, dataflow_id=req.dataflow_id, country=req.country, indicator_code=req.indicator_code, start_period=req.start_period, end_period=req.end_period, request_method=req.request_method, created_at=req.created_at).model_dump(),
-                  "observations": [ObservationResponse(country=o.country, country_name=o.country_name, indicator_code=o.indicator_code, indicator_name=o.indicator_name, time_period=o.time_period, value=o.value, unit=o.unit, frequency=o.frequency).model_dump() for o in observations]},
+            metadata=MetadataResponse(
+                endpoint="requests",
+                records=len(observations),
+                status="success",
+                ingestion_run_id=req.ingestion_run_id,
+                undata_request_id=req.id,
+            ),
+            data={
+                "request": UNDataRequestResponse(
+                    id=req.id,
+                    ingestion_run_id=req.ingestion_run_id,
+                    endpoint=req.endpoint,
+                    url=req.url,
+                    dataset_id=req.dataset_id,
+                    dataflow_id=req.dataflow_id,
+                    country=req.country,
+                    indicator_code=req.indicator_code,
+                    start_period=req.start_period,
+                    end_period=req.end_period,
+                    request_method=req.request_method,
+                    created_at=req.created_at,
+                ).model_dump(),
+                "observations": [
+                    ObservationResponse(
+                        country=o.country,
+                        country_name=o.country_name,
+                        indicator_code=o.indicator_code,
+                        indicator_name=o.indicator_name,
+                        time_period=o.time_period,
+                        value=o.value,
+                        unit=o.unit,
+                        frequency=o.frequency,
+                    ).model_dump()
+                    for o in observations
+                ],
+            },
         )
 
     def get_run(self, ingestion_run_id: uuid.UUID) -> StandardResponse:
@@ -266,5 +508,17 @@ class UNDataService:
         return StandardResponse(
             request={"ingestion_run_id": str(ingestion_run_id)},
             metadata=MetadataResponse(endpoint="runs", status="success", ingestion_run_id=run.id),
-            data={"run": IngestionRunResponse(id=run.id, source=run.source, status=run.status, started_at=run.started_at, finished_at=run.finished_at, execution_time_ms=run.execution_time_ms, request_payload=run.request_payload, error_message=run.error_message, created_at=run.created_at).model_dump()},
+            data={
+                "run": IngestionRunResponse(
+                    id=run.id,
+                    source=run.source,
+                    status=run.status,
+                    started_at=run.started_at,
+                    finished_at=run.finished_at,
+                    execution_time_ms=run.execution_time_ms,
+                    request_payload=run.request_payload,
+                    error_message=run.error_message,
+                    created_at=run.created_at,
+                ).model_dump()
+            },
         )

@@ -48,6 +48,59 @@ class UNDataIndicatorRepository:
         self._session.flush()
         return indicator
 
+    def upsert(
+        self,
+        indicator_code: str,
+        indicator_name: str,
+        category: str,
+        description: str | None = None,
+        expected_unit: str | None = None,
+        marketmind_dimension: str | None = None,
+        un_indicator_id: int | None = None,
+        un_location_id: int | None = None,
+        default_variant_id: int = 4,
+        default_age_id: int = 188,
+        default_sex_id: int = 3,
+        default_category_id: int = 0,
+        is_active: bool = True,
+    ) -> UNDataIndicatorCatalog:
+        """Unlike create(), safe to call repeatedly for the same
+        indicator_code (e.g. on every service startup) — updates the
+        existing active row in place instead of accumulating duplicates
+        that get_by_code()'s "most recent wins" ordering would otherwise
+        paper over silently."""
+        existing = self.get_by_code(indicator_code)
+        if existing is not None:
+            existing.indicator_name = indicator_name
+            existing.category = category
+            existing.description = description
+            existing.expected_unit = expected_unit
+            existing.marketmind_dimension = marketmind_dimension
+            existing.un_indicator_id = un_indicator_id
+            existing.un_location_id = un_location_id
+            existing.default_variant_id = default_variant_id
+            existing.default_age_id = default_age_id
+            existing.default_sex_id = default_sex_id
+            existing.default_category_id = default_category_id
+            existing.is_active = is_active
+            self._session.flush()
+            return existing
+        return self.create(
+            indicator_code=indicator_code,
+            indicator_name=indicator_name,
+            category=category,
+            description=description,
+            expected_unit=expected_unit,
+            marketmind_dimension=marketmind_dimension,
+            un_indicator_id=un_indicator_id,
+            un_location_id=un_location_id,
+            default_variant_id=default_variant_id,
+            default_age_id=default_age_id,
+            default_sex_id=default_sex_id,
+            default_category_id=default_category_id,
+            is_active=is_active,
+        )
+
     def get_by_code(self, indicator_code: str) -> UNDataIndicatorCatalog | None:
         result = self._session.execute(
             select(UNDataIndicatorCatalog)
