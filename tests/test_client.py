@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from app.clients.undata_client import UNDataClient
-from app.core.exceptions import UNDataClientError, UNDataTimeoutError
+from app.core.exceptions import UNDataClientError, UNDataTimeoutError, UNDataTransientError
 
 
 MOCK_INDICATORS = [{"id": 49, "name": "Total population by sex", "shortName": "TPopulation"}]
@@ -17,6 +17,7 @@ class TestUNDataClient:
     def test_get_indicators(self, mock_client_class: MagicMock) -> None:
         mock_response = MagicMock()
         mock_response.json.return_value = MOCK_INDICATORS
+        mock_response.status_code = 200
         mock_response.raise_for_status = MagicMock()
         mock_client = MagicMock()
         mock_client.get.return_value = mock_response
@@ -33,6 +34,7 @@ class TestUNDataClient:
     def test_get_locations(self, mock_client_class: MagicMock) -> None:
         mock_response = MagicMock()
         mock_response.json.return_value = MOCK_LOCATIONS
+        mock_response.status_code = 200
         mock_response.raise_for_status = MagicMock()
         mock_client = MagicMock()
         mock_client.get.return_value = mock_response
@@ -49,6 +51,7 @@ class TestUNDataClient:
     def test_get_data(self, mock_client_class: MagicMock) -> None:
         mock_response = MagicMock()
         mock_response.json.return_value = MOCK_DATA
+        mock_response.status_code = 200
         mock_response.raise_for_status = MagicMock()
         mock_client = MagicMock()
         mock_client.get.return_value = mock_response
@@ -77,9 +80,12 @@ class TestUNDataClient:
 
     @patch("app.clients.undata_client.httpx.Client")
     def test_http_error_raises(self, mock_client_class: MagicMock) -> None:
+        # 4xx is a non-retryable client error.
         mock_response = MagicMock()
-        mock_response.status_code = 500
-        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError("Error", request=MagicMock(), response=mock_response)
+        mock_response.status_code = 404
+        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "Error", request=MagicMock(), response=mock_response
+        )
         mock_client = MagicMock()
         mock_client.get.return_value = mock_response
         mock_client.__enter__ = MagicMock(return_value=mock_client)
@@ -93,9 +99,35 @@ class TestUNDataClient:
             client.get_indicators()
 
     @patch("app.clients.undata_client.httpx.Client")
+    def test_server_error_raises_transient(self, mock_client_class: MagicMock) -> None:
+        # 5xx is a transient upstream failure: raised as the retryable
+        # UNDataTransientError (before raise_for_status) and re-raised after
+        # retries are exhausted.
+        mock_response = MagicMock()
+        mock_response.status_code = 503
+        mock_response.raise_for_status = MagicMock()
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_class.return_value = mock_client
+
+        client = UNDataClient()
+        client._retries = 3
+        client._backoff = 0
+        with pytest.raises(UNDataTransientError):
+            client.get_indicators()
+
+        # All attempts were exhausted (retried), and raise_for_status was never
+        # reached because the 5xx is intercepted first.
+        assert mock_client.get.call_count == 3
+        mock_response.raise_for_status.assert_not_called()
+
+    @patch("app.clients.undata_client.httpx.Client")
     def test_get_data_range(self, mock_client_class: MagicMock) -> None:
         mock_response = MagicMock()
         mock_response.json.return_value = MOCK_DATA
+        mock_response.status_code = 200
         mock_response.raise_for_status = MagicMock()
         mock_client = MagicMock()
         mock_client.get.return_value = mock_response

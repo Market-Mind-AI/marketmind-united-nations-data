@@ -15,6 +15,16 @@ class UNDataTimeoutError(UNDataBaseException):
         super().__init__(message=message, status_code=504)
 
 
+class UNDataTransientError(UNDataBaseException):
+    """A transient upstream failure (HTTP 5xx) worth retrying — the UN Data
+    Portal API returns intermittent 500/502/503/504 under load. Distinct from
+    UNDataClientError (non-retryable, e.g. 4xx) so the retry loop can back off
+    and try again instead of failing the whole collection on a single blip."""
+
+    def __init__(self, message: str = "UN Data Portal API transient server error"):
+        super().__init__(message=message, status_code=503)
+
+
 class IndicatorNotFoundError(UNDataBaseException):
     def __init__(self, message: str = "Indicator not found in catalog"):
         super().__init__(message=message, status_code=404)

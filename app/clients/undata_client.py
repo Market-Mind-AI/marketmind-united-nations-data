@@ -4,7 +4,7 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
-from app.core.exceptions import UNDataClientError, UNDataTimeoutError
+from app.core.exceptions import UNDataClientError, UNDataTimeoutError, UNDataTransientError
 from app.core.logging import logger
 
 
@@ -72,6 +72,11 @@ class UNDataClient:
         return all_data, all_raw
 
     def _get(self, url: str) -> list[dict[str, Any]]:
+        # Only transient upstream failures (timeouts and HTTP 5xx) are retried
+        # with linear backoff. Non-transient errors (4xx, generic HTTP errors)
+        # are raised immediately — retrying them cannot help and just delays the
+        # failure. Without this, a single UN Data Portal 5xx blip permanently
+        # drops an indicator and aborts a downstream MarketMind analysis.
         last_error: Exception | None = None
 
         for attempt in range(1, self._retries + 1):
@@ -79,6 +84,8 @@ class UNDataClient:
                 logger.info(f"undata_client | GET {url} | attempt={attempt}/{self._retries}")
                 with httpx.Client(timeout=self._timeout, follow_redirects=True) as client:
                     response = client.get(url)
+                    if response.status_code >= 500:
+                        raise UNDataTransientError(f"Server error {response.status_code}: {url}")
                     response.raise_for_status()
                     data = response.json()
                     if isinstance(data, list):
@@ -91,17 +98,22 @@ class UNDataClient:
                 logger.warning(f"undata_client | timeout | attempt={attempt}/{self._retries} | url={url}")
                 if attempt < self._retries:
                     time.sleep(self._backoff * attempt)
+            except UNDataTransientError as e:
+                last_error = e
+                logger.warning(f"undata_client | transient={e.status_code} | attempt={attempt}/{self._retries}")
+                if attempt < self._retries:
+                    time.sleep(self._backoff * attempt)
             except httpx.HTTPStatusError as e:
-                last_error = e
-                logger.warning(f"undata_client | http_error={e.response.status_code} | attempt={attempt}/{self._retries}")
-                if attempt < self._retries:
-                    time.sleep(self._backoff * attempt)
+                # 4xx: non-retryable client error — fail fast.
+                logger.warning(f"undata_client | http_error={e.response.status_code} | url={url}")
+                raise UNDataClientError(f"HTTP error {e.response.status_code}: {url}") from e
             except httpx.HTTPError as e:
-                last_error = e
-                logger.warning(f"undata_client | error={e} | attempt={attempt}/{self._retries}")
-                if attempt < self._retries:
-                    time.sleep(self._backoff * attempt)
+                # Generic (non-transient) HTTP error — fail fast.
+                logger.warning(f"undata_client | error={e} | url={url}")
+                raise UNDataClientError(f"HTTP error calling UN Data Portal API: {e}") from e
 
         if isinstance(last_error, httpx.TimeoutException):
             raise UNDataTimeoutError(f"Timeout after {self._retries} retries: {last_error}") from last_error
+        if isinstance(last_error, UNDataTransientError):
+            raise last_error
         raise UNDataClientError(f"Failed after {self._retries} retries: {last_error}") from last_error

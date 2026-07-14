@@ -16,7 +16,10 @@ class Settings(BaseSettings):
     undata_api_base_url: str = "https://population.un.org/dataportalapi/uiapi/v1"
 
     default_timeout: int = 60
-    default_retries: int = 3
+    # Raised 3 -> 5: the UN Data Portal API throws intermittent 5xx/timeouts
+    # under load; extra attempts absorb transient blips so a single failure
+    # does not drop an indicator and abort a downstream MarketMind analysis.
+    default_retries: int = 5
     default_backoff: int = 2
 
     log_level: str = "INFO"
