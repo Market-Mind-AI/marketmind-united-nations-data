@@ -139,3 +139,79 @@ class TestUNDataClient:
         data, raw = client.get_data_range(indicator_id=49, location_id=724, start_year=2020, end_year=2021)
         assert len(data) == 2
         assert len(raw) == 2
+
+
+class TestSerieToleraAnoQueFalha:
+    """A API do portal devolve UM ano por chamada, então uma série de 11 anos são
+    11 requisições. Até 27/08/2026 qualquer uma que falhasse derrubava a série
+    inteira — e a que derrubava era quase sempre a primeira do laço, o ano mais
+    antigo, justamente o que menos importa: os indicadores do MarketMind leem os
+    3 últimos anos.
+
+    Medido no incidente de 25/08/2026: 78 coletas encerradas em erro porque a
+    requisição de 2016 voltou 503, e com elas 9 dos 24 países de uma análise
+    saíram do ranking por causa de um ano que ninguém ia usar.
+    """
+
+    @staticmethod
+    def _resposta(status: int = 200) -> MagicMock:
+        resposta = MagicMock()
+        resposta.json.return_value = MOCK_DATA
+        resposta.status_code = status
+        resposta.raise_for_status = MagicMock()
+        return resposta
+
+    @staticmethod
+    def _cliente(mock_client_class: MagicMock, respostas: list[MagicMock]) -> MagicMock:
+        mock_client = MagicMock()
+        mock_client.get.side_effect = respostas
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_class.return_value = mock_client
+        return mock_client
+
+    @patch("app.clients.undata_client.time.sleep", MagicMock())
+    @patch("app.clients.undata_client.httpx.Client")
+    def test_ano_que_falha_e_pulado_e_a_serie_sobrevive(self, mock_client_class: MagicMock) -> None:
+        # 2016 falha (503 em todas as tentativas), 2017 e 2018 vêm.
+        respostas = [self._resposta(503) for _ in range(3)] + [self._resposta(), self._resposta()]
+        self._cliente(mock_client_class, respostas)
+
+        client = UNDataClient()
+        data, raw = client.get_data_range(indicator_id=49, location_id=724, start_year=2016, end_year=2018)
+
+        assert len(raw) == 2, "os dois anos que vieram continuam na série"
+        assert len(data) == 2
+
+    @patch("app.clients.undata_client.time.sleep", MagicMock())
+    @patch("app.clients.undata_client.httpx.Client")
+    def test_nenhum_ano_obtido_ainda_e_erro(self, mock_client_class: MagicMock) -> None:
+        """"A fonte está fora do ar" tem que continuar sendo erro: é assim que a
+        coleta falha e o Core sabe que a causa é transitória e vale insistir.
+        Engolir isso devolveria série vazia como se fosse resposta legítima."""
+        self._cliente(mock_client_class, [self._resposta(503) for _ in range(9)])
+
+        client = UNDataClient()
+        with pytest.raises(UNDataTransientError):
+            client.get_data_range(indicator_id=49, location_id=724, start_year=2016, end_year=2018)
+
+
+class TestBackoffExponencial:
+    def test_dobra_a_cada_tentativa_com_jitter(self) -> None:
+        """O backoff linear (2s, 4s, 6s) some contra indisponibilidade real: em
+        25/08/2026 o portal ficou 29 minutos fora e as 3 tentativas de cada
+        requisição se esgotavam em ~6 segundos, sempre dentro da janela ruim."""
+        client = UNDataClient()
+        base = client._backoff
+
+        for tentativa, esperado in ((1, base), (2, base * 2), (3, base * 4)):
+            espera = client._espera(tentativa)
+            assert esperado <= espera <= esperado * 1.25
+
+    def test_jitter_separa_requisicoes_que_sairam_em_rajada(self) -> None:
+        """Uma coleta são 11 anos × N indicadores saindo juntos. Sem jitter,
+        todos repetem no mesmo instante e batem de novo juntos numa fonte que já
+        está sobrecarregada."""
+        client = UNDataClient()
+        esperas = {client._espera(2) for _ in range(20)}
+        assert len(esperas) > 1, "a espera não pode ser idêntica para todos"
