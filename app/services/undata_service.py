@@ -604,3 +604,47 @@ class UNDataService:
             metadata=MetadataResponse(endpoint="freshness", records=len(items), stored=False, status="success"),
             data={"as_of": now, "stale_after_days": stale_after_days, "items": items},
         )
+
+    # -- Read (what was collected, without opening this service's database) --
+
+    def get_series(
+        self, *, country: str, indicator_code: str, limit: int | None = None
+    ) -> StandardResponse:
+        """One indicator's stored values for one country, newest period first.
+
+        Reading another service's tables directly couples the reader to a schema
+        it does not own: a column rename here breaks a calculation there,
+        silently and at the worst moment. This is the seam that keeps that from
+        happening.
+
+        Values come back as rows, never as an average or a rate. That arithmetic
+        is versioned method and belongs to whoever owns the method.
+
+        Omit `limit` when you need the whole series -- lining up two indicators
+        year by year needs both in full, since the years they cover need not
+        match.
+        """
+        country = country.strip().upper()
+        indicator_code = indicator_code.strip()
+        observations = self._observation_repo.series(
+            country=country, indicator_code=indicator_code, limit=limit
+        )
+        return StandardResponse(
+            request={"country": country, "indicator_code": indicator_code, "limit": limit},
+            metadata=MetadataResponse(
+                endpoint="observations_series", records=len(observations), stored=False, status="success"
+            ),
+            data={
+                "country": country,
+                "indicator_code": indicator_code,
+                "points": [
+                    {
+                        "time_period": o.time_period,
+                        "value": o.value,
+                        "unit": o.unit,
+                        "frequency": o.frequency,
+                    }
+                    for o in observations
+                ],
+            },
+        )

@@ -54,3 +54,25 @@ class UNDataObservationRepository:
             .order_by(UNDataObservation.time_period)
         )
         return list(result.scalars().all())
+
+    def series(
+        self, *, country: str, indicator_code: str, limit: int | None = None
+    ) -> list[UNDataObservation]:
+        """One indicator's values for a country, newest period first, nulls dropped.
+
+        `limit` is optional and omitting it is a real use, not laziness: a
+        caller that has to line up two indicators year by year -- net migration
+        against total population, say -- needs both full series, because the
+        years they cover do not necessarily match and the overlap is only
+        knowable after reading both.
+        """
+        stmt = (
+            select(UNDataObservation)
+            .where(UNDataObservation.country == country)
+            .where(UNDataObservation.indicator_code == indicator_code)
+            .where(UNDataObservation.value.is_not(None))
+            .order_by(UNDataObservation.time_period.desc())
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self._session.execute(stmt).scalars().all())

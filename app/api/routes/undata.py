@@ -105,6 +105,31 @@ def register_indicators_catalog(
 
 
 @router.get(
+    "/observations/series",
+    response_model=StandardResponse,
+    summary="Read one indicator's stored values for one country",
+    description=(
+        "Returns the values this service has collected, newest period first, "
+        "with nulls dropped.\n\n"
+        "Rows come back, never a computed figure: an average, a rate or a ratio "
+        "is method, it is versioned, and it belongs to whoever owns the method "
+        "rather than to this service.\n\n"
+        "Omit `limit` to read the whole series. That is a real use rather than "
+        "laziness: lining up two indicators year by year needs both in full, "
+        "because the years they cover need not match and the overlap is only "
+        "knowable after reading both."
+    ),
+)
+def get_series(
+    country: str = Query(..., description="Country code as stored, e.g. ES"),
+    indicator_code: str = Query(..., description="Indicator code, e.g. TOTAL_POPULATION"),
+    limit: int | None = Query(None, ge=1, le=1000, description="Most recent N periods only."),
+    service: UNDataService = Depends(get_undata_service),
+) -> StandardResponse:
+    return service.get_series(country=country, indicator_code=indicator_code, limit=limit)
+
+
+@router.get(
     "/freshness",
     response_model=StandardResponse,
     summary="What this service holds, and when it last looked",
