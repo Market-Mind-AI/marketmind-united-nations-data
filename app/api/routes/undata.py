@@ -10,6 +10,7 @@ from app.core.exceptions import (
 )
 from app.schemas.requests import (
     CollectIndicatorsRequest,
+    RefreshStaleRequest,
     RegisterDataflowsRequest,
     RegisterDatastructuresRequest,
     RegisterIndicatorsCatalogRequest,
@@ -102,6 +103,30 @@ def register_indicators_catalog(
     request: RegisterIndicatorsCatalogRequest, service: UNDataService = Depends(get_undata_service)
 ) -> StandardResponse:
     return service.register_indicators(request)
+
+
+@router.post(
+    "/maintenance/refresh-stale",
+    response_model=StandardResponse,
+    summary="Collect again whatever has not been looked at in a while",
+    description=(
+        "The scheduled half of keeping data current. The other half is the "
+        "on-demand collection: something decides a country is needed now and "
+        "asks for it.\n\n"
+        "Each stale country is replayed from what it was last collected with, "
+        "window moved to now. Replaying is not a shortcut here: collecting "
+        "needs a numeric UN location id that cannot be derived from the country "
+        "code, so replaying is what keeps that mapping out of this service.\n\n"
+        "A country never collected is skipped, not invented -- it arrives "
+        "through the on-demand path the first time.\n\n"
+        "Bounded by `limit`. One country failing does not end the pass."
+    ),
+)
+def refresh_stale(
+    request: RefreshStaleRequest | None = None,
+    service: UNDataService = Depends(get_undata_service),
+) -> StandardResponse:
+    return service.refresh_stale(request or RefreshStaleRequest())
 
 
 @router.get(

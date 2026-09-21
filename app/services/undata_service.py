@@ -25,6 +25,7 @@ from app.repositories.undata_request_repository import UNDataRequestRepository
 from app.schemas.requests import (
     CollectIndicatorsRequest,
     IndicatorCatalogItem,
+    RefreshStaleRequest,
     RegisterDataflowsRequest,
     RegisterDatastructuresRequest,
     RegisterIndicatorsCatalogRequest,
@@ -646,5 +647,84 @@ class UNDataService:
                     }
                     for o in observations
                 ],
+            },
+        )
+
+    # -- Scheduled maintenance (the half of freshness nobody has to ask for) --
+
+    def refresh_stale(self, request: RefreshStaleRequest) -> StandardResponse:
+        """Collect again whatever has not been looked at in a while.
+
+        The other half is the on-demand collection: something decides a country
+        is needed now and asks. Between the two, what this service holds stays
+        current without anyone tracking it from outside -- and a second record
+        of what was collected, kept elsewhere, drifts from the tables while the
+        tables are the ones that can be wrong in silence.
+
+        Bounded on purpose: a first run against a long-idle database finds every
+        country stale at once, and the upstream API has its own patience.
+
+        Each country is REPLAYED from what it was last collected with. That is
+        not a shortcut here -- collecting needs a numeric location id that is
+        not derivable from the country code this service stores, so replaying is
+        what keeps that mapping out of this service entirely.
+        """
+        freshness = self.get_freshness(stale_after_days=request.stale_after_days, only_stale=True)
+
+        stale_countries: list[str] = []
+        for item in freshness.data["items"]:
+            if item["country"] not in stale_countries:
+                stale_countries.append(item["country"])
+
+        setups = self._ingestion_repo.last_collect_setup_by_country()
+        end_year = utc_now().year
+        start_year = end_year - request.years_back + 1
+
+        outcomes: list[dict[str, Any]] = []
+        refreshed = failed = skipped = 0
+
+        for country in stale_countries[: request.limit]:
+            setup = setups.get(country)
+            if setup is None or not setup.get("location_id") or not setup.get("indicator_codes"):
+                skipped += 1
+                outcomes.append(
+                    {
+                        "country": country,
+                        "outcome": "skipped",
+                        "detail": "no successful collection to replay; collect it once on demand first",
+                    }
+                )
+                continue
+
+            try:
+                self.collect_indicators(
+                    CollectIndicatorsRequest(
+                        country=country,
+                        location_id=int(setup["location_id"]),
+                        start_year=start_year,
+                        end_year=end_year,
+                        indicator_codes=setup["indicator_codes"],
+                    )
+                )
+                refreshed += 1
+                outcomes.append({"country": country, "outcome": "refreshed", "detail": None})
+            except Exception as exc:  # noqa: BLE001 - one country failing must not end the pass
+                failed += 1
+                logger.warning(f"Scheduled refresh failed for country={country}: {exc}")
+                outcomes.append({"country": country, "outcome": "failed", "detail": str(exc)})
+
+        return StandardResponse(
+            request={"stale_after_days": request.stale_after_days, "limit": request.limit},
+            metadata=MetadataResponse(
+                endpoint="maintenance_refresh_stale", records=len(outcomes), stored=True, status="success"
+            ),
+            data={
+                "stale_after_days": request.stale_after_days,
+                "stale_countries": len(stale_countries),
+                "attempted": len(outcomes),
+                "refreshed": refreshed,
+                "failed": failed,
+                "skipped": skipped,
+                "countries": outcomes,
             },
         )

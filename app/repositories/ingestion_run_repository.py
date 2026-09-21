@@ -53,3 +53,38 @@ class IngestionRunRepository:
     def get_by_id(self, run_id: uuid.UUID) -> IngestionRun | None:
         result = self._session.execute(select(IngestionRun).where(IngestionRun.id == run_id))
         return result.scalar_one_or_none()
+
+    def last_collect_setup_by_country(self) -> dict[str, dict[str, Any]]:
+        """Per country, the upstream location id and the indicators it was collected with.
+
+        A refresh replays what was asked before rather than composing a new
+        request. That matters more here than elsewhere: collecting from the UN
+        needs a numeric location id, which is not derivable from the country
+        code this service stores. Replaying means the service never has to keep
+        that mapping, and whatever a caller once set up keeps working.
+
+        One run is recorded per indicator, so the indicators for a country are
+        gathered across its runs rather than read off a single payload.
+
+        PARTIAL counts alongside SUCCESS. A partial run did return data, so its
+        setup is known to work, and an incomplete collection is exactly the one
+        worth running again. FAILED is excluded: replaying it would repeat the
+        failure on a schedule.
+        """
+        payload = IngestionRun.request_payload
+        country = payload["country"].astext
+        indicator = payload["indicator_code"].astext
+        stmt = (
+            select(country, indicator, payload["location_id"].astext, IngestionRun.started_at)
+            .where(IngestionRun.status.in_([IngestionStatus.SUCCESS, IngestionStatus.PARTIAL]))
+            .where(country.is_not(None))
+            .where(indicator.is_not(None))
+            .order_by(IngestionRun.started_at.desc())
+        )
+
+        setups: dict[str, dict[str, Any]] = {}
+        for country_code, indicator_code, location_id, _started_at in self._session.execute(stmt).all():
+            setup = setups.setdefault(country_code, {"location_id": location_id, "indicator_codes": []})
+            if indicator_code not in setup["indicator_codes"]:
+                setup["indicator_codes"].append(indicator_code)
+        return setups
