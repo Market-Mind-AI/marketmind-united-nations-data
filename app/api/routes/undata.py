@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.api.dependencies import get_undata_service
 from app.core.exceptions import (
@@ -102,6 +102,39 @@ def register_indicators_catalog(
     request: RegisterIndicatorsCatalogRequest, service: UNDataService = Depends(get_undata_service)
 ) -> StandardResponse:
     return service.register_indicators(request)
+
+
+@router.get(
+    "/freshness",
+    response_model=StandardResponse,
+    summary="What this service holds, and when it last looked",
+    description=(
+        "Reports, per country and indicator, when this service last ASKED the "
+        "UN -- not how recent the returned data is. UN Data publishes yearly, "
+        "so a 2024 population figure is the current one, and a staleness rule "
+        "written against the datum's own period would re-fetch every indicator "
+        "every day forever.\n\n"
+        "A pair that was checked and came back empty still reports a "
+        "last_checked_at, so a country the source genuinely has no data for is "
+        "not mistaken for one that was never tried.\n\n"
+        "Naming both country and indicator asks a closed question and gets a "
+        "closed answer: every requested pair is returned, including pairs never "
+        "fetched (last_checked_at null, stale true)."
+    ),
+)
+def get_freshness(
+    country: list[str] | None = Query(None, description="Country codes. Repeat the parameter for several."),
+    indicator: list[str] | None = Query(None, description="Indicator codes. Repeat for several."),
+    stale_after_days: int = Query(30, ge=1, le=3650, description="A check older than this counts as stale."),
+    only_stale: bool = Query(False, description="Return only the pairs that need collecting."),
+    service: UNDataService = Depends(get_undata_service),
+) -> StandardResponse:
+    return service.get_freshness(
+        countries=country,
+        indicators=indicator,
+        stale_after_days=stale_after_days,
+        only_stale=only_stale,
+    )
 
 
 @router.get(

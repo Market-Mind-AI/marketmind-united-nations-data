@@ -1,5 +1,6 @@
 import json
 import uuid
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -13,6 +14,7 @@ from app.core.exceptions import (
 )
 from app.core.logging import logger
 from app.domain.enums import IndicatorCategory, IngestionStatus, MarketMindDimension, RequestMethod
+from app.repositories.freshness_repository import FreshnessRepository
 from app.repositories.ingestion_run_repository import IngestionRunRepository
 from app.repositories.raw_api_response_repository import RawApiResponseRepository
 from app.repositories.undata_dataflow_repository import UNDataDataflowRepository
@@ -101,6 +103,7 @@ class UNDataService:
         self._datastructure_repo = UNDataDatastructureRepository(session)
         self._observation_repo = UNDataObservationRepository(session)
         self._indicator_repo = UNDataIndicatorRepository(session)
+        self._freshness_repo = FreshnessRepository(session)
 
     # ── Remote (proxy to UN API) ──
 
@@ -534,4 +537,70 @@ class UNDataService:
                     created_at=run.created_at,
                 ).model_dump()
             },
+        )
+
+    # -- Freshness (what we hold, and when we last looked) --
+
+    def get_freshness(
+        self,
+        *,
+        countries: list[str] | None = None,
+        indicators: list[str] | None = None,
+        stale_after_days: int = 30,
+        only_stale: bool = False,
+    ) -> StandardResponse:
+        """What this service holds and when it last looked, per country and indicator.
+
+        Reports when we last ASKED the UN, not how recent the returned data is.
+        UN Data publishes yearly, so a 2024 population figure is the current one
+        rather than a stale one, and a rule written against the datum's own
+        period would re-fetch every indicator every day forever.
+
+        Naming BOTH a country and an indicator asks a closed question, so it
+        gets a closed answer: every requested pair comes back, including pairs
+        never fetched, marked stale with last_checked_at null. An empty list
+        would be indistinguishable from "everything is fresh".
+        """
+        countries = [c.strip().upper() for c in countries if c.strip()] if countries else None
+        indicators = [i.strip() for i in indicators if i.strip()] if indicators else None
+
+        checks = self._freshness_repo.last_checks(countries=countries, indicators=indicators)
+        observed = self._freshness_repo.observation_facts(countries=countries, indicators=indicators)
+
+        if countries and indicators:
+            pairs = [(country, indicator) for country in countries for indicator in indicators]
+        else:
+            pairs = sorted(set(checks) | set(observed))
+
+        now = utc_now()
+        cutoff = now - timedelta(days=stale_after_days)
+
+        items: list[dict[str, Any]] = []
+        for country, indicator in pairs:
+            last_checked_at = checks.get((country, indicator))
+            facts = observed.get((country, indicator))
+            stale = last_checked_at is None or last_checked_at < cutoff
+            if only_stale and not stale:
+                continue
+            items.append(
+                {
+                    "country": country,
+                    "indicator_code": indicator,
+                    "last_checked_at": last_checked_at,
+                    "last_observation_at": facts.last_observation_at if facts else None,
+                    "latest_period": facts.latest_period if facts else None,
+                    "observation_count": facts.observation_count if facts else 0,
+                    "stale": stale,
+                }
+            )
+
+        return StandardResponse(
+            request={
+                "countries": countries,
+                "indicators": indicators,
+                "stale_after_days": stale_after_days,
+                "only_stale": only_stale,
+            },
+            metadata=MetadataResponse(endpoint="freshness", records=len(items), stored=False, status="success"),
+            data={"as_of": now, "stale_after_days": stale_after_days, "items": items},
         )
