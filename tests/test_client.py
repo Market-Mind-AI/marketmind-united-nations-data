@@ -188,6 +188,7 @@ class TestSerieToleraAnoQueFalha:
         self._cliente(mock_client_class, respostas)
 
         client = UNDataClient()
+        client._retries = 3  # a lista de respostas acima conta com 3 tentativas por ano
         data, raw = client.get_data_range(indicator_id=49, location_id=724, start_year=2016, end_year=2018)
 
         assert len(raw) == 2, "os dois anos que vieram continuam na série"
@@ -202,6 +203,7 @@ class TestSerieToleraAnoQueFalha:
         self._cliente(mock_client_class, [self._resposta(503) for _ in range(9)])
 
         client = UNDataClient()
+        client._retries = 3  # 3 anos x 3 tentativas = as 9 respostas acima
         with pytest.raises(UNDataTransientError):
             client.get_data_range(indicator_id=49, location_id=724, start_year=2016, end_year=2018)
 
