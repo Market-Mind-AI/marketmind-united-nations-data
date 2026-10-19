@@ -119,7 +119,10 @@ def list_datastructures(
     "/indicators/catalog",
     response_model=StandardResponse,
     summary="Register Indicators Catalog",
-    description="Create or update the internal catalog of UN indicators. Each indicator must include un_indicator_id (the numeric ID from the UN Population Data Portal API).",
+    description=(
+        "Create or update the internal catalog of UN indicators. Each indicator must include "
+        "un_indicator_id (the numeric ID from the UN Population Data Portal API)."
+    ),
 )
 def register_indicators_catalog(
     request: RegisterIndicatorsCatalogRequest, service: UNDataService = Depends(get_undata_service)
@@ -236,7 +239,10 @@ def seed_catalog(service: UNDataService = Depends(get_undata_service)) -> Standa
     "/indicators/collect",
     response_model=StandardResponse,
     summary="Collect Indicators",
-    description="Collect indicators from the UN Population Data Portal API for a given country/location and year range. Each indicator must have un_indicator_id configured in the catalog.",
+    description=(
+        "Collect indicators from the UN Population Data Portal API for a given country/location and year "
+        "range. Each indicator must have un_indicator_id configured in the catalog."
+    ),
 )
 def collect_indicators(
     request: CollectIndicatorsRequest, service: UNDataService = Depends(get_undata_service)

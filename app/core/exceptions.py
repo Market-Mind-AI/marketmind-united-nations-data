@@ -25,11 +25,6 @@ class UNDataTransientError(UNDataBaseException):
         super().__init__(message=message, status_code=503)
 
 
-class IndicatorNotFoundError(UNDataBaseException):
-    def __init__(self, message: str = "Indicator not found in catalog"):
-        super().__init__(message=message, status_code=404)
-
-
 class IndicatorNotConfiguredError(UNDataBaseException):
     def __init__(self, message: str = "Indicator not configured for collection"):
         super().__init__(message=message, status_code=422)

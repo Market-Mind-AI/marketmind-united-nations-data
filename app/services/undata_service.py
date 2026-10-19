@@ -13,7 +13,7 @@ from app.core.exceptions import (
     UNDataBaseException,
 )
 from app.core.logging import logger
-from app.domain.enums import IndicatorCategory, IngestionStatus, MarketMindDimension, RequestMethod
+from app.domain.enums import IndicatorCategory, MarketMindDimension, RequestMethod
 from app.repositories.freshness_repository import FreshnessRepository
 from app.repositories.ingestion_run_repository import IngestionRunRepository
 from app.repositories.raw_api_response_repository import RawApiResponseRepository
@@ -326,7 +326,10 @@ class UNDataService:
                     "end_year": request.end_year,
                 },
             )
-            base_url = f"{settings.undata_api_base_url}/data/indicators/{indicator.un_indicator_id}/locations/{request.location_id}/years/..."
+            base_url = (
+                f"{settings.undata_api_base_url}/data/indicators/{indicator.un_indicator_id}"
+                f"/locations/{request.location_id}/years/..."
+            )
             undata_req = self._request_repo.create(
                 ingestion_run_id=run.id,
                 endpoint="indicators_collect",
@@ -422,7 +425,8 @@ class UNDataService:
                     ]
                 )
                 logger.info(
-                    f"endpoint=indicators_collect | ingestion_run_id={run.id} | country={request.country} | indicator={code} | records={len(observations)} | status=success"
+                    f"endpoint=indicators_collect | ingestion_run_id={run.id} | country={request.country} "
+                    f"| indicator={code} | records={len(observations)} | status=success"
                 )
 
             except UNDataBaseException as e:
@@ -608,9 +612,7 @@ class UNDataService:
 
     # -- Read (what was collected, without opening this service's database) --
 
-    def get_series(
-        self, *, country: str, indicator_code: str, limit: int | None = None
-    ) -> StandardResponse:
+    def get_series(self, *, country: str, indicator_code: str, limit: int | None = None) -> StandardResponse:
         """One indicator's stored values for one country, newest period first.
 
         Reading another service's tables directly couples the reader to a schema
@@ -627,9 +629,7 @@ class UNDataService:
         """
         country = country.strip().upper()
         indicator_code = indicator_code.strip()
-        observations = self._observation_repo.series(
-            country=country, indicator_code=indicator_code, limit=limit
-        )
+        observations = self._observation_repo.series(country=country, indicator_code=indicator_code, limit=limit)
         return StandardResponse(
             request={"country": country, "indicator_code": indicator_code, "limit": limit},
             metadata=MetadataResponse(

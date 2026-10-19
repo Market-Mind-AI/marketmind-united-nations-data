@@ -7,11 +7,32 @@ from app.api.dependencies import get_undata_service
 from app.main import app
 from app.schemas.responses import MetadataResponse, StandardResponse
 
-MOCK_LIST = StandardResponse(request={}, metadata=MetadataResponse(endpoint="test", records=0, status="success"), data={"items": []})
+MOCK_LIST = StandardResponse(
+    request={}, metadata=MetadataResponse(endpoint="test", records=0, status="success"), data={"items": []}
+)
 MOCK_COLLECT = StandardResponse(
     request={},
-    metadata=MetadataResponse(endpoint="indicators_collect", execution_time_ms=100, records=1, stored=True, status="success", ingestion_run_id=uuid4(), undata_request_id=uuid4()),
-    data={"observations": [{"country": "ES", "indicator_code": "TOTAL_POPULATION", "time_period": "2020", "value": 47000000, "unit": "persons", "frequency": "A"}]},
+    metadata=MetadataResponse(
+        endpoint="indicators_collect",
+        execution_time_ms=100,
+        records=1,
+        stored=True,
+        status="success",
+        ingestion_run_id=uuid4(),
+        undata_request_id=uuid4(),
+    ),
+    data={
+        "observations": [
+            {
+                "country": "ES",
+                "indicator_code": "TOTAL_POPULATION",
+                "time_period": "2020",
+                "value": 47000000,
+                "unit": "persons",
+                "frequency": "A",
+            }
+        ]
+    },
 )
 
 
@@ -66,7 +87,11 @@ class TestDataflowEndpoints:
 
 class TestDatastructureEndpoints:
     def test_register(self) -> None:
-        _test("post", "/datastructures/register", {"dataflow_id": "WPP", "dimensions": [{"dimension_id": "REF", "codes": []}]})
+        _test(
+            "post",
+            "/datastructures/register",
+            {"dataflow_id": "WPP", "dimensions": [{"dimension_id": "REF", "codes": []}]},
+        )
 
     def test_list(self) -> None:
         _test("get", "/datastructures")
@@ -74,13 +99,36 @@ class TestDatastructureEndpoints:
 
 class TestIndicatorEndpoints:
     def test_register(self) -> None:
-        _test("post", "/indicators/catalog", {"indicators": [{"indicator_code": "POP", "indicator_name": "Pop", "category": "total_population", "un_indicator_id": 49}]})
+        _test(
+            "post",
+            "/indicators/catalog",
+            {
+                "indicators": [
+                    {
+                        "indicator_code": "POP",
+                        "indicator_name": "Pop",
+                        "category": "total_population",
+                        "un_indicator_id": 49,
+                    }
+                ]
+            },
+        )
 
     def test_list(self) -> None:
         _test("get", "/indicators/catalog")
 
     def test_collect(self) -> None:
-        _test("post", "/indicators/collect", {"country": "ES", "location_id": 724, "start_year": 2020, "end_year": 2023, "indicator_codes": ["TOTAL_POPULATION"]})
+        _test(
+            "post",
+            "/indicators/collect",
+            {
+                "country": "ES",
+                "location_id": 724,
+                "start_year": 2020,
+                "end_year": 2023,
+                "indicator_codes": ["TOTAL_POPULATION"],
+            },
+        )
 
 
 class TestAuditEndpoints:

@@ -19,20 +19,8 @@ class UNDataClient:
     def get_indicators(self) -> list[dict[str, Any]]:
         return self._get(f"{self._base_url}/indicators")
 
-    def get_indicator(self, indicator_id: int) -> list[dict[str, Any]]:
-        return self._get(f"{self._base_url}/indicators/{indicator_id}")
-
     def get_locations(self) -> list[dict[str, Any]]:
         return self._get(f"{self._base_url}/locations/tvAlphabetical")
-
-    def get_location(self, location_id: int) -> list[dict[str, Any]]:
-        return self._get(f"{self._base_url}/locations/{location_id}")
-
-    def get_sources(self) -> list[dict[str, Any]]:
-        return self._get(f"{self._base_url}/sources")
-
-    def get_time_dimensions(self) -> list[dict[str, Any]]:
-        return self._get(f"{self._base_url}/dimensions/times?timeType=single")
 
     def get_data(
         self,
@@ -128,8 +116,9 @@ class UNDataClient:
         return base * random.uniform(1.0, 1.25)
 
     def _get(self, url: str) -> list[dict[str, Any]]:
-        # Only transient upstream failures (timeouts and HTTP 5xx) are retried
-        # with linear backoff. Non-transient errors (4xx, generic HTTP errors)
+        # Only transient upstream failures (timeouts and HTTP 5xx) are retried,
+        # with exponential backoff plus jitter (see _espera). Non-transient
+        # errors (4xx, generic HTTP errors)
         # are raised immediately — retrying them cannot help and just delays the
         # failure. Without this, a single UN Data Portal 5xx blip permanently
         # drops an indicator and aborts a downstream MarketMind analysis.

@@ -9,7 +9,17 @@ from app.core.exceptions import UNDataClientError, UNDataTimeoutError, UNDataTra
 
 MOCK_INDICATORS = [{"id": 49, "name": "Total population by sex", "shortName": "TPopulation"}]
 MOCK_LOCATIONS = [{"id": 724, "name": "Spain", "iso3": "ESP", "iso2": "ES"}]
-MOCK_DATA = [{"locationId": 724, "indicatorId": 49, "timeLabel": "2020", "value": 47679489, "sex": "Both sexes", "variant": "Medium", "ageLabel": "Total"}]
+MOCK_DATA = [
+    {
+        "locationId": 724,
+        "indicatorId": 49,
+        "timeLabel": "2020",
+        "value": 47679489,
+        "sex": "Both sexes",
+        "variant": "Medium",
+        "ageLabel": "Total",
+    }
+]
 
 
 class TestUNDataClient:
@@ -186,7 +196,7 @@ class TestSerieToleraAnoQueFalha:
     @patch("app.clients.undata_client.time.sleep", MagicMock())
     @patch("app.clients.undata_client.httpx.Client")
     def test_nenhum_ano_obtido_ainda_e_erro(self, mock_client_class: MagicMock) -> None:
-        """"A fonte está fora do ar" tem que continuar sendo erro: é assim que a
+        """ "A fonte está fora do ar" tem que continuar sendo erro: é assim que a
         coleta falha e o Core sabe que a causa é transitória e vale insistir.
         Engolir isso devolveria série vazia como se fosse resposta legítima."""
         self._cliente(mock_client_class, [self._resposta(503) for _ in range(9)])

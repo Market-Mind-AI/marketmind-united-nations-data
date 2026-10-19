@@ -110,14 +110,6 @@ class UNDataIndicatorRepository:
         )
         return result.scalars().first()
 
-    def get_all_active(self) -> list[UNDataIndicatorCatalog]:
-        result = self._session.execute(
-            select(UNDataIndicatorCatalog)
-            .where(UNDataIndicatorCatalog.is_active.is_(True))
-            .order_by(UNDataIndicatorCatalog.created_at.desc())
-        )
-        return list(result.scalars().all())
-
     def get_all(self) -> list[UNDataIndicatorCatalog]:
         result = self._session.execute(
             select(UNDataIndicatorCatalog).order_by(UNDataIndicatorCatalog.created_at.desc())

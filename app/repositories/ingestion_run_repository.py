@@ -34,14 +34,6 @@ class IngestionRunRepository:
         self._session.flush()
         return run
 
-    def mark_partial(self, run: IngestionRun, execution_time_ms: int, error_message: str | None = None) -> IngestionRun:
-        run.status = IngestionStatus.PARTIAL
-        run.finished_at = utc_now()
-        run.execution_time_ms = execution_time_ms
-        run.error_message = error_message
-        self._session.flush()
-        return run
-
     def mark_failed(self, run: IngestionRun, error_message: str, execution_time_ms: int) -> IngestionRun:
         run.status = IngestionStatus.FAILED
         run.finished_at = utc_now()

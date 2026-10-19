@@ -41,7 +41,9 @@ class IndicatorCatalogItem(BaseModel):
     marketmind_dimension: MarketMindDimension | None = Field(
         None, examples=[MarketMindDimension.MARKET_POPULATION_POTENTIAL]
     )
-    un_indicator_id: int | None = Field(None, examples=[49], description="Indicator ID from UN Population Data Portal API")
+    un_indicator_id: int | None = Field(
+        None, examples=[49], description="Indicator ID from UN Population Data Portal API"
+    )
     un_location_id: int | None = Field(None, examples=[724], description="Default location ID (e.g. 724=Spain)")
     default_variant_id: int = Field(4, examples=[4], description="Variant ID (4=Medium)")
     default_age_id: int = Field(188, examples=[188], description="Age ID (188=Total)")

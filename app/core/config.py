@@ -7,8 +7,6 @@ from app.db.ssl_config import sslmode_query_suffix
 
 class Settings(BaseSettings):
     app_name: str = "marketmind-united-nations-data"
-    app_env: str = "local"
-    app_port: int = 8000
     app_version: str = "0.2.0"
 
     database_host: str = "localhost"
