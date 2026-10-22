@@ -11,6 +11,8 @@ from app.core.exceptions import (
     IndicatorNotConfiguredError,
     ResourceNotFoundError,
     UNDataBaseException,
+    UNDataTimeoutError,
+    UNDataTransientError,
 )
 from app.core.logging import logger
 from app.domain.enums import IndicatorCategory, MarketMindDimension, RequestMethod
@@ -302,6 +304,7 @@ class UNDataService:
     def collect_indicators(self, request: CollectIndicatorsRequest) -> StandardResponse:
         all_observations: list[dict[str, Any]] = []
         errors: list[str] = []
+        source_down = 0  # failures that were the portal's (5xx, timeout), not ours
         run_ids: list[str] = []
         request_ids: list[str] = []
 
@@ -441,6 +444,8 @@ class UNDataService:
                 self._ingestion_repo.mark_failed(run, str(e), exec_time)
                 self._session.commit()
                 errors.append(f"Failed collecting {code}: {e}")
+                if isinstance(e, (UNDataTransientError, UNDataTimeoutError)):
+                    source_down += 1
             except Exception as e:
                 exec_time = elapsed_ms(start)
                 self._raw_response_repo.create(
@@ -455,6 +460,13 @@ class UNDataService:
                 errors.append(f"Failed collecting {code}: {e}")
 
         if errors and not all_observations:
+            # Nothing came back. If every failure was the portal's own (5xx or
+            # timeout), the portal is down: say so, with a status that means
+            # "try again". Until 22/10/2026 this was a 422 "indicator not
+            # configured" -- a 50-minute outage read as a configuration error
+            # on every trace and every log line.
+            if source_down == len(errors):
+                raise UNDataTransientError("UN Data Portal unavailable: " + "; ".join(errors))
             raise IndicatorNotConfiguredError("; ".join(errors))
 
         status = "success" if not errors else "partial"

@@ -4,10 +4,18 @@ from datetime import datetime
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.db.models.ingestion_run import IngestionRun
 from app.db.models.undata_observation import UNDataObservation
 from app.db.models.undata_request import UNDataRequest
 
 Pair = tuple[str, str]
+
+# A check is a collection that FINISHED. A request whose run failed asked and
+# got nothing back -- the source was down -- and counting it as a check made a
+# 50-minute UN Data outage (22/10/2026) report twenty pairs as fresh for the
+# whole window, with their last real data a month old. A run still in flight is
+# not a check yet either.
+CHECKED_STATUSES = ("success", "partial")
 
 
 @dataclass(frozen=True)
@@ -35,6 +43,8 @@ class FreshnessRepository:
     ) -> dict[Pair, datetime]:
         stmt = (
             select(UNDataRequest.country, UNDataRequest.indicator_code, func.max(UNDataRequest.created_at))
+            .join(IngestionRun, IngestionRun.id == UNDataRequest.ingestion_run_id)
+            .where(IngestionRun.status.in_(CHECKED_STATUSES))
             .where(UNDataRequest.country.is_not(None))
             .where(UNDataRequest.indicator_code.is_not(None))
             .group_by(UNDataRequest.country, UNDataRequest.indicator_code)
