@@ -11,7 +11,8 @@ from app.core.exceptions import (
     IndicatorNotConfiguredError,
     ResourceNotFoundError,
     UNDataBaseException,
-    UNDataTimeoutError,
+    UNDataClientError,
+    UNDataEmptyResponseError,
     UNDataTransientError,
 )
 from app.core.logging import logger
@@ -301,22 +302,61 @@ class UNDataService:
 
     # ── Collect Indicators ──
 
+    def _configured_indicators(self, codes: list[str]) -> dict[str, Any]:
+        """Os indicadores do catálogo que este pedido nomeia -- ou recusa o pedido.
+
+        Um código que o catálogo não conhece, ou que não tem `un_indicator_id`
+        para ser coletado, é erro de quem pediu, e recusar o pedido inteiro com
+        422 é a mesma regra nos três coletores de indicadores. Até 26/10/2026
+        este serviço coletava os outros e só no fim respondia 422, e a mesma
+        situação era 400 na OCDE e 404 no World Bank. A recusa vem antes de
+        abrir qualquer execução: não houve coleta, e não há o que registrar.
+        """
+        catalog: dict[str, Any] = {}
+        problems: list[str] = []
+        for code in codes:
+            indicator = self._indicator_repo.get_by_code(code)
+            if not indicator:
+                problems.append(f"Indicator {code} not found in catalog")
+            elif not indicator.un_indicator_id:
+                problems.append(f"Indicator {code} has no un_indicator_id configured")
+            else:
+                catalog[code] = indicator
+        if problems:
+            raise IndicatorNotConfiguredError("; ".join(problems))
+        return catalog
+
+    @staticmethod
+    def _collect_failure(failures: dict[str, Exception]) -> UNDataBaseException:
+        """O erro de uma coleta em que NENHUM indicador teve resposta da fonte.
+
+        Uma coleta que não trouxe nada levanta erro -- a mesma regra nos três
+        coletores de indicadores:
+
+        - toda falha foi passageira (5xx, 429, timeout, rede): a fonte está
+          fora, e o erro é 503 -- "tente de novo", que é o que vale fazer. Até
+          22/10/2026 isto era um 422 "indicator not configured", e uma queda de
+          50 minutos aparecia como erro de configuração em todo trace e log;
+        - alguma falha foi uma resposta definitiva que não serve: 502. Também
+          era 422, e não é erro de quem pediu.
+
+        4xx fica só para erro de quem pediu, que é recusado antes de coletar
+        (`_configured_indicators`).
+        """
+        detail = "; ".join(f"{code}: {error}" for code, error in failures.items())
+        if all(isinstance(error, UNDataTransientError) for error in failures.values()):
+            return UNDataTransientError("UN Data Portal unavailable: " + detail)
+        return UNDataClientError("No indicator could be collected: " + detail)
+
     def collect_indicators(self, request: CollectIndicatorsRequest) -> StandardResponse:
+        catalog = self._configured_indicators(request.indicator_codes)
         all_observations: list[dict[str, Any]] = []
-        errors: list[str] = []
-        source_down = 0  # failures that were the portal's (5xx, timeout), not ours
+        failures: dict[str, Exception] = {}
         run_ids: list[str] = []
         request_ids: list[str] = []
 
         for code in request.indicator_codes:
-            indicator = self._indicator_repo.get_by_code(code)
-            if not indicator:
-                errors.append(f"Indicator {code} not found in catalog")
-                continue
-            if not indicator.un_indicator_id:
-                errors.append(f"Indicator {code} has no un_indicator_id configured")
-                continue
-
+            indicator = catalog[code]
             start = utc_now()
             run = self._ingestion_repo.create(
                 source="united_nations_data",
@@ -329,43 +369,50 @@ class UNDataService:
                     "end_year": request.end_year,
                 },
             )
-            base_url = (
-                f"{settings.undata_api_base_url}/data/indicators/{indicator.un_indicator_id}"
-                f"/locations/{request.location_id}/years/..."
-            )
-            undata_req = self._request_repo.create(
-                ingestion_run_id=run.id,
-                endpoint="indicators_collect",
-                url=base_url,
-                request_method=RequestMethod.GET,
-                dataset_id="UN_WPP",
-                dataflow_id="WPP2024",
-                country=request.country,
-                indicator_code=code,
-                start_period=str(request.start_year),
-                end_period=str(request.end_year),
-                query_params={
-                    "un_indicator_id": indicator.un_indicator_id,
-                    "location_id": request.location_id,
-                    "variant_id": indicator.default_variant_id,
-                    "age_id": indicator.default_age_id,
-                    "sex_id": indicator.default_sex_id,
-                    "category_id": indicator.default_category_id,
-                },
-            )
 
             try:
-                data_rows, raw_rows = self._client.get_data_range(
-                    indicator_id=indicator.un_indicator_id,
-                    location_id=request.location_id,
-                    start_year=request.start_year,
-                    end_year=request.end_year,
-                    variant_id=indicator.default_variant_id,
-                    age_id=indicator.default_age_id,
-                    sex_id=indicator.default_sex_id,
-                    category_id=indicator.default_category_id,
-                )
+                try:
+                    data_rows, raw_rows = self._client.get_data_range(
+                        indicator_id=indicator.un_indicator_id,
+                        location_id=request.location_id,
+                        start_year=request.start_year,
+                        end_year=request.end_year,
+                        variant_id=indicator.default_variant_id,
+                        age_id=indicator.default_age_id,
+                        sex_id=indicator.default_sex_id,
+                        category_id=indicator.default_category_id,
+                    )
+                except UNDataEmptyResponseError:
+                    # A fonte respondeu que não tem: é resposta, conta como
+                    # verificação, e não é falha.
+                    data_rows, raw_rows = [], []
 
+                # A verificação: a linha de requisição só nasce depois que a
+                # fonte respondeu. Um indicador que falhou não ganha linha, e
+                # por isso não conta como verificado (FreshnessRepository).
+                undata_req = self._request_repo.create(
+                    ingestion_run_id=run.id,
+                    endpoint="indicators_collect",
+                    url=(
+                        f"{settings.undata_api_base_url}/data/indicators/{indicator.un_indicator_id}"
+                        f"/locations/{request.location_id}/years/..."
+                    ),
+                    request_method=RequestMethod.GET,
+                    dataset_id="UN_WPP",
+                    dataflow_id="WPP2024",
+                    country=request.country,
+                    indicator_code=code,
+                    start_period=str(request.start_year),
+                    end_period=str(request.end_year),
+                    query_params={
+                        "un_indicator_id": indicator.un_indicator_id,
+                        "location_id": request.location_id,
+                        "variant_id": indicator.default_variant_id,
+                        "age_id": indicator.default_age_id,
+                        "sex_id": indicator.default_sex_id,
+                        "category_id": indicator.default_category_id,
+                    },
+                )
                 self._raw_response_repo.create(
                     undata_request_id=undata_req.id,
                     endpoint="indicators_collect",
@@ -400,7 +447,7 @@ class UNDataService:
                 observations = normalize_observations(raw_observations)
 
                 if observations:
-                    self._observation_repo.bulk_create(
+                    self._observation_repo.replace_periods(
                         undata_request_id=undata_req.id,
                         observations=observations,
                         dataset_id="UN_WPP",
@@ -432,56 +479,33 @@ class UNDataService:
                     f"| indicator={code} | records={len(observations)} | status=success"
                 )
 
-            except UNDataBaseException as e:
-                exec_time = elapsed_ms(start)
-                self._raw_response_repo.create(
-                    undata_request_id=undata_req.id,
-                    endpoint="indicators_collect",
-                    request_payload={"indicator": code},
-                    response_payload={"error": str(e)},
-                    response_text=str(e),
-                )
-                self._ingestion_repo.mark_failed(run, str(e), exec_time)
-                self._session.commit()
-                errors.append(f"Failed collecting {code}: {e}")
-                if isinstance(e, (UNDataTransientError, UNDataTimeoutError)):
-                    source_down += 1
             except Exception as e:
                 exec_time = elapsed_ms(start)
-                self._raw_response_repo.create(
-                    undata_request_id=undata_req.id,
-                    endpoint="indicators_collect",
-                    request_payload={"indicator": code},
-                    response_payload={"error": str(e)},
-                    response_text=str(e),
-                )
                 self._ingestion_repo.mark_failed(run, str(e), exec_time)
                 self._session.commit()
-                errors.append(f"Failed collecting {code}: {e}")
+                failures[code] = e
+                logger.warning(
+                    f"endpoint=indicators_collect | ingestion_run_id={run.id} | country={request.country} "
+                    f"| indicator={code} | status=failed | error={e}"
+                )
 
-        if errors and not all_observations:
-            # Nothing came back. If every failure was the portal's own (5xx or
-            # timeout), the portal is down: say so, with a status that means
-            # "try again". Until 22/10/2026 this was a 422 "indicator not
-            # configured" -- a 50-minute outage read as a configuration error
-            # on every trace and every log line.
-            if source_down == len(errors):
-                raise UNDataTransientError("UN Data Portal unavailable: " + "; ".join(errors))
-            raise IndicatorNotConfiguredError("; ".join(errors))
+        if not request_ids:
+            raise self._collect_failure(failures)
 
-        status = "success" if not errors else "partial"
+        errors = [f"Failed collecting {code}: {error}" for code, error in failures.items()]
         return StandardResponse(
             request=request.model_dump(),
             metadata=MetadataResponse(
                 endpoint="indicators_collect",
                 records=len(all_observations),
                 stored=True,
-                status=status,
+                status="success",
                 collected_at=utc_now(),
             ),
             data={
                 "observations": all_observations,
                 "errors": errors if errors else None,
+                "indicators_failed": list(failures),
                 "ingestion_run_ids": run_ids,
                 "undata_request_ids": request_ids,
             },
@@ -563,7 +587,7 @@ class UNDataService:
         *,
         countries: list[str] | None = None,
         indicators: list[str] | None = None,
-        stale_after_days: int = 30,
+        stale_after_days: int = 90,
         only_stale: bool = False,
     ) -> StandardResponse:
         """What this service holds and when it last looked, per country and indicator.
@@ -680,6 +704,11 @@ class UNDataService:
         not a shortcut here -- collecting needs a numeric location id that is
         not derivable from the country code this service stores, so replaying is
         what keeps that mapping out of this service entirely.
+
+        Um país só conta como renovado quando TODOS os seus indicadores tiveram
+        resposta. Se algum falhou, o país conta como falha, com os códigos no
+        detalhe -- é o que faz `fail_if_incomplete` acusar uma queda parcial da
+        fonte em vez de deixá-la passar como noite boa. Mesma regra nos três.
         """
         freshness = self.get_freshness(stale_after_days=request.stale_after_days, only_stale=True)
 
@@ -690,7 +719,9 @@ class UNDataService:
 
         setups = self._ingestion_repo.last_collect_setup_by_country()
         end_year = utc_now().year
-        start_year = end_year - request.years_back + 1
+        # A mesma janela que o Core pede: de `years_back` anos atrás até este
+        # ano, inclusive (macro_coverage, `_ANNUAL_LOOKBACK_YEARS`).
+        start_year = end_year - request.years_back
 
         outcomes: list[dict[str, Any]] = []
         refreshed = failed = skipped = 0
@@ -709,7 +740,7 @@ class UNDataService:
                 continue
 
             try:
-                self.collect_indicators(
+                response = self.collect_indicators(
                     CollectIndicatorsRequest(
                         country=country,
                         location_id=int(setup["location_id"]),
@@ -718,12 +749,26 @@ class UNDataService:
                         indicator_codes=setup["indicator_codes"],
                     )
                 )
-                refreshed += 1
-                outcomes.append({"country": country, "outcome": "refreshed", "detail": None})
             except Exception as exc:  # noqa: BLE001 - one country failing must not end the pass
                 failed += 1
                 logger.warning(f"Scheduled refresh failed for country={country}: {exc}")
                 outcomes.append({"country": country, "outcome": "failed", "detail": str(exc)})
+                continue
+
+            not_collected = response.data["indicators_failed"]
+            if not_collected:
+                failed += 1
+                logger.warning(f"Scheduled refresh incomplete for country={country}: {not_collected}")
+                outcomes.append(
+                    {
+                        "country": country,
+                        "outcome": "failed",
+                        "detail": f"indicators not collected: {', '.join(not_collected)}",
+                    }
+                )
+            else:
+                refreshed += 1
+                outcomes.append({"country": country, "outcome": "refreshed", "detail": None})
 
         return StandardResponse(
             request={"stale_after_days": request.stale_after_days, "limit": request.limit},

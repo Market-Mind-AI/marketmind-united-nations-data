@@ -1,4 +1,5 @@
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from app.schemas.requests import RefreshStaleRequest
@@ -13,8 +14,12 @@ def _service(mock_session: MagicMock, *, checks: dict | None = None, setups: dic
     service._freshness_repo.last_checks = MagicMock(return_value=checks or {})
     service._freshness_repo.observation_facts = MagicMock(return_value={})
     service._ingestion_repo.last_collect_setup_by_country = MagicMock(return_value=setups or {})
-    service.collect_indicators = MagicMock()
+    service.collect_indicators = MagicMock(return_value=_collected())
     return service
+
+
+def _collected(failed: list[str] | None = None) -> SimpleNamespace:
+    return SimpleNamespace(data={"indicators_failed": failed or []})
 
 
 def _setup(location_id: str = "724", indicators: list[str] | None = None) -> dict:
@@ -24,7 +29,7 @@ def _setup(location_id: str = "724", indicators: list[str] | None = None) -> dic
 def test_a_stale_country_is_collected_again(mock_session: MagicMock) -> None:
     service = _service(
         mock_session,
-        checks={("ES", _POP): utc_now() - timedelta(days=45)},
+        checks={("ES", _POP): utc_now() - timedelta(days=91)},
         setups={"ES": _setup()},
     )
 
@@ -52,7 +57,7 @@ def test_the_location_id_comes_from_the_stored_setup(mock_session: MagicMock) ->
     refresh replays instead of composing a request."""
     service = _service(
         mock_session,
-        checks={("FR", _POP): utc_now() - timedelta(days=45)},
+        checks={("FR", _POP): utc_now() - timedelta(days=91)},
         setups={"FR": _setup(location_id="250")},
     )
 
@@ -64,7 +69,7 @@ def test_the_location_id_comes_from_the_stored_setup(mock_session: MagicMock) ->
 def test_the_window_moves_to_now(mock_session: MagicMock) -> None:
     service = _service(
         mock_session,
-        checks={("ES", _POP): utc_now() - timedelta(days=45)},
+        checks={("ES", _POP): utc_now() - timedelta(days=91)},
         setups={"ES": _setup()},
     )
 
@@ -72,11 +77,42 @@ def test_the_window_moves_to_now(mock_session: MagicMock) -> None:
 
     sent = service.collect_indicators.call_args.args[0]
     assert sent.end_year == utc_now().year
-    assert sent.start_year == utc_now().year - 4
+    assert sent.start_year == utc_now().year - 5
+
+
+def test_the_default_window_is_the_one_the_core_asks_for(mock_session: MagicMock) -> None:
+    """O Core coleta de dez anos atrás até este ano; a renovação noturna pede o
+    mesmo, para não guardar uma série mais curta que a da primeira coleta."""
+    service = _service(
+        mock_session,
+        checks={("ES", _POP): utc_now() - timedelta(days=91)},
+        setups={"ES": _setup()},
+    )
+
+    service.refresh_stale(RefreshStaleRequest())
+
+    sent = service.collect_indicators.call_args.args[0]
+    assert (sent.start_year, sent.end_year) == (utc_now().year - 10, utc_now().year)
+
+
+def test_a_country_with_an_indicator_left_behind_counts_as_failed(mock_session: MagicMock) -> None:
+    """Renovado só quando todo indicador teve resposta. Uma queda parcial da
+    fonte passava como noite boa, e `fail_if_incomplete` nunca a acusava."""
+    service = _service(
+        mock_session,
+        checks={("ES", _POP): utc_now() - timedelta(days=91)},
+        setups={"ES": _setup(indicators=[_POP, "MEDIAN_AGE"])},
+    )
+    service.collect_indicators = MagicMock(return_value=_collected(["MEDIAN_AGE"]))
+
+    response = service.refresh_stale(RefreshStaleRequest())
+
+    assert (response.data["refreshed"], response.data["failed"]) == (0, 1)
+    assert "MEDIAN_AGE" in response.data["countries"][0]["detail"]
 
 
 def test_a_country_never_collected_is_skipped_not_invented(mock_session: MagicMock) -> None:
-    service = _service(mock_session, checks={("PE", _POP): utc_now() - timedelta(days=45)}, setups={})
+    service = _service(mock_session, checks={("PE", _POP): utc_now() - timedelta(days=91)}, setups={})
 
     response = service.refresh_stale(RefreshStaleRequest())
 
@@ -87,7 +123,7 @@ def test_a_country_never_collected_is_skipped_not_invented(mock_session: MagicMo
 def test_a_setup_without_a_location_id_is_skipped(mock_session: MagicMock) -> None:
     service = _service(
         mock_session,
-        checks={("ES", _POP): utc_now() - timedelta(days=45)},
+        checks={("ES", _POP): utc_now() - timedelta(days=91)},
         setups={"ES": _setup(location_id="")},
     )
 
@@ -98,7 +134,7 @@ def test_a_setup_without_a_location_id_is_skipped(mock_session: MagicMock) -> No
 
 
 def test_the_pass_is_bounded(mock_session: MagicMock) -> None:
-    old = utc_now() - timedelta(days=45)
+    old = utc_now() - timedelta(days=91)
     countries = ["ES", "BR", "US", "DE", "JP"]
     service = _service(
         mock_session,
@@ -113,13 +149,13 @@ def test_the_pass_is_bounded(mock_session: MagicMock) -> None:
 
 
 def test_one_country_failing_does_not_end_the_pass(mock_session: MagicMock) -> None:
-    old = utc_now() - timedelta(days=45)
+    old = utc_now() - timedelta(days=91)
     service = _service(
         mock_session,
         checks={("ES", _POP): old, ("BR", _POP): old},
         setups={"ES": _setup(), "BR": _setup()},
     )
-    service.collect_indicators = MagicMock(side_effect=[RuntimeError("upstream down"), None])
+    service.collect_indicators = MagicMock(side_effect=[RuntimeError("upstream down"), _collected()])
 
     response = service.refresh_stale(RefreshStaleRequest())
 
@@ -165,3 +201,20 @@ def test_a_complete_pass_never_refuses() -> None:
 
     completa = SimpleNamespace(data=SimpleNamespace(failed=0))
     _refuse_if_incomplete(completa, RefreshStaleRequest(fail_if_incomplete=True))
+
+
+def test_the_real_response_can_refuse() -> None:
+    """A resposta deste serviço guarda `data` como dicionário, e o teste acima,
+    com um objeto, escondia que `getattr(dict, "failed", 0)` é sempre 0: o
+    serviço nunca recusava, nem numa noite em que todos os países falharam."""
+    import pytest
+    from fastapi import HTTPException
+
+    from app.api.routes.undata import _refuse_if_incomplete
+    from app.schemas.responses import MetadataResponse, StandardResponse
+
+    resposta = StandardResponse(metadata=MetadataResponse(endpoint="x", status="success"), data={"failed": 2})
+
+    with pytest.raises(HTTPException) as erro:
+        _refuse_if_incomplete(resposta, RefreshStaleRequest(fail_if_incomplete=True))
+    assert erro.value.status_code == 503

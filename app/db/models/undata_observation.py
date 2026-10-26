@@ -37,4 +37,5 @@ class UNDataObservation(Base):
         Index("ix_undata_observations_country", "country"),
         Index("ix_undata_observations_indicator_code", "indicator_code"),
         Index("ix_undata_observations_time_period", "time_period"),
+        Index("ix_undata_observations_series", "country", "indicator_code", "time_period"),
     )

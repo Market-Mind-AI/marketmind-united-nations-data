@@ -56,11 +56,12 @@ class IngestionRunRepository:
         that mapping, and whatever a caller once set up keeps working.
 
         One run is recorded per indicator, so the indicators for a country are
-        gathered across its runs rather than read off a single payload.
+        gathered across its runs rather than read off a single payload. É a
+        regra dos três coletores: o Core pede um indicador por coleta, e
+        replicar só o pedido mais recente renovaria um indicador por país por
+        noite.
 
-        PARTIAL counts alongside SUCCESS. A partial run did return data, so its
-        setup is known to work, and an incomplete collection is exactly the one
-        worth running again. FAILED is excluded: replaying it would repeat the
+        Only successful runs: replaying a request that failed would repeat the
         failure on a schedule.
         """
         payload = IngestionRun.request_payload
@@ -68,7 +69,7 @@ class IngestionRunRepository:
         indicator = payload["indicator_code"].astext
         stmt = (
             select(country, indicator, payload["location_id"].astext, IngestionRun.started_at)
-            .where(IngestionRun.status.in_([IngestionStatus.SUCCESS, IngestionStatus.PARTIAL]))
+            .where(IngestionRun.status == IngestionStatus.SUCCESS)
             .where(country.is_not(None))
             .where(indicator.is_not(None))
             .order_by(IngestionRun.started_at.desc())

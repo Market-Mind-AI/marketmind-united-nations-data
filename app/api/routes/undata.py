@@ -4,7 +4,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.api.dependencies import get_undata_service
 from app.core.exceptions import (
-    IndicatorNotConfiguredError,
     ResourceNotFoundError,
     UNDataBaseException,
 )
@@ -35,7 +34,10 @@ def _refuse_if_incomplete(resposta, pedido) -> None:
     if not getattr(pedido, "fail_if_incomplete", False):
         return
     dados = getattr(resposta, "data", resposta)
-    falharam = getattr(dados, "failed", 0) or 0
+    # Aqui `data` é um dicionário, não um objeto como nos outros coletores, e
+    # `getattr(dict, "failed", 0)` é sempre 0: até 26/10/2026 este serviço
+    # nunca recusava, nem numa noite em que todos os países falharam.
+    falharam = (dados.get("failed", 0) if isinstance(dados, dict) else getattr(dados, "failed", 0)) or 0
     if falharam:
         raise HTTPException(
             status_code=503,
@@ -138,8 +140,11 @@ def register_indicators_catalog(
         "The scheduled half of keeping data current. The other half is the "
         "on-demand collection: something decides a country is needed now and "
         "asks for it.\n\n"
-        "Each stale country is replayed from what it was last collected with, "
-        "window moved to now. Replaying is not a shortcut here: collecting "
+        "Each stale country is replayed with every indicator from its "
+        "SUCCESSFUL collections, gathered across runs, over the window the Core "
+        "asks for (`years_back`, default 10). A country counts as refreshed only "
+        "when every one of its indicators got an answer. Replaying is not a "
+        "shortcut here: collecting "
         "needs a numeric UN location id that cannot be derived from the country "
         "code, so replaying is what keeps that mapping out of this service.\n\n"
         "A country never collected is skipped, not invented -- it arrives "
@@ -203,7 +208,7 @@ def get_series(
 def get_freshness(
     country: list[str] | None = Query(None, description="Country codes. Repeat the parameter for several."),
     indicator: list[str] | None = Query(None, description="Indicator codes. Repeat for several."),
-    stale_after_days: int = Query(30, ge=1, le=3650, description="A check older than this counts as stale."),
+    stale_after_days: int = Query(90, ge=1, le=3650, description="A check older than this counts as stale."),
     only_stale: bool = Query(False, description="Return only the pairs that need collecting."),
     service: UNDataService = Depends(get_undata_service),
 ) -> StandardResponse:
@@ -247,10 +252,12 @@ def seed_catalog(service: UNDataService = Depends(get_undata_service)) -> Standa
 def collect_indicators(
     request: CollectIndicatorsRequest, service: UNDataService = Depends(get_undata_service)
 ) -> StandardResponse:
+    # Cada exceção carrega o próprio status, o mesmo nos três coletores: 422
+    # para indicador que o catálogo não conhece (o único erro de quem pediu),
+    # 503 para a fonte fora do ar depois de todas as tentativas, 502 para uma
+    # resposta da fonte que não serve.
     try:
         return service.collect_indicators(request)
-    except IndicatorNotConfiguredError as e:
-        raise HTTPException(status_code=422, detail=e.message) from e
     except UNDataBaseException as e:
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
 

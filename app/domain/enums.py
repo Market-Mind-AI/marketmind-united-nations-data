@@ -5,7 +5,6 @@ class IngestionStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     SUCCESS = "success"
-    PARTIAL = "partial"
     FAILED = "failed"
 
 

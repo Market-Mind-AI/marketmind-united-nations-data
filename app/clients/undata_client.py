@@ -1,12 +1,18 @@
-import random
 import time
 from typing import Any
 
 import httpx
 
 from app.core.config import settings
-from app.core.exceptions import UNDataClientError, UNDataTimeoutError, UNDataTransientError
+from app.core.exceptions import (
+    UNDataClientError,
+    UNDataEmptyResponseError,
+    UNDataRateLimitError,
+    UNDataTimeoutError,
+    UNDataTransientError,
+)
 from app.core.logging import logger
+from app.utils.retry import backoff_seconds, is_retryable_status
 
 
 class UNDataClient:
@@ -14,7 +20,6 @@ class UNDataClient:
         self._base_url = settings.undata_api_base_url
         self._timeout = settings.default_timeout
         self._retries = settings.default_retries
-        self._backoff = settings.default_backoff
 
     def get_indicators(self) -> list[dict[str, Any]]:
         return self._get(f"{self._base_url}/indicators")
@@ -63,28 +68,33 @@ class UNDataClient:
         análise, cada um por causa de um ano que ninguém ia usar.
 
         A regra agora: um ano que falha é registrado e pulado; só quando NENHUM
-        ano vem é que o erro sobe. Assim "a fonte está fora do ar" continua
-        sendo um erro (e o Core sabe insistir), enquanto "um ano do meio da
-        série não veio" deixa de ser.
+        ano tem resposta é que o erro sobe. Assim "a fonte está fora do ar"
+        continua sendo um erro (e o Core sabe insistir), enquanto "um ano do
+        meio da série não veio" deixa de ser. Um ano em que a fonte responde
+        404 TEVE resposta: ela não tem o dado, e isso não é falha.
         """
         all_data: list[dict[str, Any]] = []
         all_raw: list[dict[str, Any]] = []
         anos_perdidos: list[int] = []
+        respondidos = 0
         ultimo_erro: Exception | None = None
 
         for year in range(start_year, end_year + 1):
             try:
                 rows = self.get_data(indicator_id, location_id, year, variant_id, age_id, sex_id, category_id)
-            except (UNDataTransientError, UNDataTimeoutError, UNDataClientError) as exc:
+            except UNDataEmptyResponseError:
+                rows = []
+            except (UNDataTransientError, UNDataClientError) as exc:
                 anos_perdidos.append(year)
                 ultimo_erro = exc
                 continue
+            respondidos += 1
             all_raw.extend(rows)
             for row in rows:
                 if row.get("value") is not None:
                     all_data.append(row)
 
-        if anos_perdidos and not all_raw:
+        if anos_perdidos and not respondidos:
             # Nenhum ano veio: é a fonte fora do ar, não um buraco na série.
             # Precisa subir para a coleta falhar e o Core saber que vale
             # insistir (a causa é transitória).
@@ -100,65 +110,53 @@ class UNDataClient:
             )
         return all_data, all_raw
 
-    def _espera(self, attempt: int) -> float:
-        """Backoff EXPONENCIAL com jitter, não linear.
-
-        O backoff linear (2s, 4s, 6s) some contra uma indisponibilidade real:
-        em 25/08/2026 o portal ficou 29 minutos fora e as 3 tentativas de cada
-        requisição se esgotaram em ~6 segundos, sempre dentro da janela ruim.
-        Dobrar dá chance de a janela passar sem multiplicar as chamadas.
-
-        O jitter existe porque as requisições saem em rajada — uma coleta são
-        11 anos × N indicadores — e sem ele todas repetem no mesmo instante,
-        batendo de novo juntas numa fonte que já está sobrecarregada.
-        """
-        base = self._backoff * (2 ** (attempt - 1))
-        return base * random.uniform(1.0, 1.25)
-
     def _get(self, url: str) -> list[dict[str, Any]]:
-        # Only transient upstream failures (timeouts and HTTP 5xx) are retried,
-        # with exponential backoff plus jitter (see _espera). Non-transient
-        # errors (4xx, generic HTTP errors)
-        # are raised immediately — retrying them cannot help and just delays the
-        # failure. Without this, a single UN Data Portal 5xx blip permanently
-        # drops an indicator and aborts a downstream MarketMind analysis.
-        last_error: Exception | None = None
+        """Uma chamada à API, insistindo enquanto a falha for passageira.
 
+        Quando e quanto insistir é a política comum aos quatro coletores, em
+        app/utils/retry.py. A base é a que este serviço já tinha desde que o
+        portal ficou 29 minutos fora em 25/08/2026 (exponencial com jitter); o
+        que mudou é que agora 429 e erro de rede também são repetidos, e o
+        Retry-After é obedecido. Esgotadas as tentativas, a falha passageira
+        sobe como UNDataTransientError (503). Um 404 é a fonte dizendo que não
+        tem o dado e sobe como UNDataEmptyResponseError, sem repetir; os outros
+        4xx sobem como UNDataClientError, também sem repetir.
+        """
+        last_error: UNDataTransientError | None = None
         for attempt in range(1, self._retries + 1):
+            retry_after: str | None = None
+            logger.info(f"undata_client | GET {url} | attempt={attempt}/{self._retries}")
             try:
-                logger.info(f"undata_client | GET {url} | attempt={attempt}/{self._retries}")
                 with httpx.Client(timeout=self._timeout, follow_redirects=True) as client:
                     response = client.get(url)
-                    if response.status_code >= 500:
-                        raise UNDataTransientError(f"Server error {response.status_code}: {url}")
-                    response.raise_for_status()
+            except httpx.TimeoutException as e:
+                last_error = UNDataTimeoutError(f"Timeout calling UN Data Portal API: {url}: {e}")
+            except httpx.HTTPError as e:
+                # Rede: DNS, conexão recusada ou derrubada. É a fonte (ou o
+                # caminho até ela) fora do ar, e esperar resolve.
+                last_error = UNDataTransientError(f"Network error calling UN Data Portal API: {e}")
+            else:
+                status = response.status_code
+                if is_retryable_status(status):
+                    retry_after = response.headers.get("Retry-After")
+                    if status == 429:
+                        last_error = UNDataRateLimitError(f"Rate limited: {url}")
+                    else:
+                        last_error = UNDataTransientError(f"Server error {status}: {url}")
+                elif status == 404:
+                    raise UNDataEmptyResponseError(f"No data at {url}")
+                elif status >= 400:
+                    raise UNDataClientError(f"HTTP error {status}: {url}")
+                else:
                     data = response.json()
                     if isinstance(data, list):
                         return data
                     if isinstance(data, dict) and "data" in data:
                         return data["data"]
                     return [data] if data else []
-            except httpx.TimeoutException as e:
-                last_error = e
-                logger.warning(f"undata_client | timeout | attempt={attempt}/{self._retries} | url={url}")
-                if attempt < self._retries:
-                    time.sleep(self._espera(attempt))
-            except UNDataTransientError as e:
-                last_error = e
-                logger.warning(f"undata_client | transient={e.status_code} | attempt={attempt}/{self._retries}")
-                if attempt < self._retries:
-                    time.sleep(self._espera(attempt))
-            except httpx.HTTPStatusError as e:
-                # 4xx: non-retryable client error — fail fast.
-                logger.warning(f"undata_client | http_error={e.response.status_code} | url={url}")
-                raise UNDataClientError(f"HTTP error {e.response.status_code}: {url}") from e
-            except httpx.HTTPError as e:
-                # Generic (non-transient) HTTP error — fail fast.
-                logger.warning(f"undata_client | error={e} | url={url}")
-                raise UNDataClientError(f"HTTP error calling UN Data Portal API: {e}") from e
 
-        if isinstance(last_error, httpx.TimeoutException):
-            raise UNDataTimeoutError(f"Timeout after {self._retries} retries: {last_error}") from last_error
-        if isinstance(last_error, UNDataTransientError):
-            raise last_error
-        raise UNDataClientError(f"Failed after {self._retries} retries: {last_error}") from last_error
+            logger.warning(f"undata_client | attempt={attempt}/{self._retries} failed | {last_error}")
+            if attempt < self._retries:
+                time.sleep(backoff_seconds(attempt, retry_after))
+
+        raise last_error or UNDataTransientError(f"Failed after {self._retries} attempts: {url}")

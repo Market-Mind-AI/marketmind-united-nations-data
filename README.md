@@ -25,7 +25,7 @@ app/
   api/routes/         # FastAPI route handlers (no business logic)
   core/               # Config, logging, exceptions
   domain/             # Enums, entities
-  clients/            # UNDataClient (httpx.Client, retry with exponential backoff)
+  clients/            # UNDataClient (httpx.Client, retry policy in app/utils/retry.py)
   services/           # UNDataService (orchestration)
   repositories/       # Database persistence layer
   db/models/          # SQLAlchemy ORM models
@@ -106,9 +106,9 @@ all 5 services' databases). See `marketmind-scoring/README.md`.
 | `DATABASE_PASSWORD` | `marketmind_password` | Database password |
 | `DATABASE_SSL_MODE` | `disable` | `disable`, `require` or `verify-full` (Azure needs at least `require`) |
 | `UNDATA_API_BASE_URL` | `https://population.un.org/dataportalapi/uiapi/v1` | UN Population Data Portal API |
-| `DEFAULT_TIMEOUT` | `60` | HTTP timeout (seconds) |
-| `DEFAULT_RETRIES` | `5` | Attempts per request (`.env.example` sets 3) |
-| `DEFAULT_BACKOFF` | `2` | Base of the exponential backoff (seconds) |
+| `DEFAULT_TIMEOUT` | `60` | HTTP timeout (seconds), same in every collector |
+| `DEFAULT_RETRIES` | `5` | Attempts per call, same in every collector |
+| `DEFAULT_BACKOFF` | `2` | First wait (seconds); doubles per attempt, with jitter, capped at 60 s |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
 ## API Endpoints
@@ -147,7 +147,7 @@ all 5 services' databases). See `marketmind-scoring/README.md`.
 | `POST` | `/indicators/collect` | Collect indicators for a country/location and year range |
 | `GET` | `/observations/series` | Read one indicator's stored values for one country (`country`, `indicator_code`, optional `limit`) |
 | `GET` | `/freshness` | What is stored and when it was last checked (`country`, `indicator`, `stale_after_days`, `only_stale`) |
-| `POST` | `/maintenance/refresh-stale` | Collect again every country whose last check is older than `stale_after_days` (default 30); `limit`, `fail_if_incomplete` |
+| `POST` | `/maintenance/refresh-stale` | Collect again every country whose last check is older than `stale_after_days` (default 90); `limit`, `fail_if_incomplete`, `years_back` (default 10) |
 
 ### Audit
 
@@ -204,24 +204,24 @@ curl -X POST http://localhost:8002/indicators/collect \
   }'
 ```
 
-One `ingestion_run` and one `undata_request` are recorded per indicator. The response carries
-them in `data.ingestion_run_ids` and `data.undata_request_ids`, next to `data.observations`
-and `data.errors`; `metadata.status` is `success`, or `partial` when some indicators failed.
-When every indicator failed the call answers 422.
+One `ingestion_run` is recorded per indicator, and one `undata_request` per indicator the portal
+answered. The response carries the successful ones in `data.ingestion_run_ids` and
+`data.undata_request_ids`, next to `data.observations`, `data.errors` and `data.indicators_failed`.
+When no indicator got an answer the call answers 503 (portal down) or 502.
 
 ### Step 4: Read back, check freshness, refresh
 
 ```bash
 curl "http://localhost:8002/observations/series?country=ES&indicator_code=TOTAL_POPULATION&limit=3"
 
-curl "http://localhost:8002/freshness?country=ES&stale_after_days=30&only_stale=true"
+curl "http://localhost:8002/freshness?country=ES&stale_after_days=90&only_stale=true"
 
 curl -X POST http://localhost:8002/maintenance/refresh-stale \
   -H "Content-Type: application/json" \
-  -d '{"stale_after_days": 30, "fail_if_incomplete": true}'
+  -d '{"stale_after_days": 90, "fail_if_incomplete": true}'
 ```
 
-The refresh replays each country's last successful collection (location id and indicators),
+The refresh replays each country's successful collections (location id and every indicator),
 so the service never has to keep a country-to-location mapping of its own.
 
 ## Running Tests
@@ -250,10 +250,28 @@ mypy .
 ## UN Portal API Behaviour and Limitations
 
 - The portal returns **one year per call**, so a series of 11 years is 11 requests per indicator.
-- A year that fails is logged and skipped; the collection fails only when **no** year came back. That keeps "the source is down" an error (worth retrying) while "one year in the middle is missing" is not.
-- Transient failures (timeouts, HTTP 5xx) are retried up to `DEFAULT_RETRIES` times with **exponential backoff plus jitter**: the wait before attempt `n` is `DEFAULT_BACKOFF * 2^(n-1)` seconds, multiplied by a random factor between 1.0 and 1.25 (2 s, 4 s, 8 s, ... with `DEFAULT_BACKOFF=2`).
-- 4xx responses and other non-transient HTTP errors **fail fast**: they are raised on the first attempt and never retried.
+- A year that fails is logged and skipped; the collection fails only when **no** year got an answer. That keeps "the source is down" an error (worth retrying) while "one year in the middle is missing" is not. A year the portal answers with 404 did get an answer: it has no data.
 - Response times can be slow for large year ranges; prefer the range you need and `/maintenance/refresh-stale` over blanket re-collection.
+
+## Collection rules (the same in every MarketMind collector)
+
+- **Retries** (`app/utils/retry.py`): 408, 429, any 5xx, timeouts and network errors are retried, up to
+  `DEFAULT_RETRIES` attempts, waiting `DEFAULT_BACKOFF` seconds doubled per attempt, with jitter, capped at
+  60 s; a `Retry-After` header is honoured up to the same cap. Other 4xx are never retried.
+- **HTTP status**: `422` when the request names an indicator the catalog does not have, or one without a
+  `un_indicator_id` (the only caller error, refused before anything is collected); `503` when the source
+  stayed down through every attempt; `502` when the source answered with something unusable.
+- **A collection that got nothing raises**: if no requested indicator got an answer, `/indicators/collect`
+  answers `503` (every failure transient) or `502`.
+- **What counts as a check**: one `undata_requests` row per (country, indicator) that got an answer from the
+  source -- data, or a definitive "no data". Failed indicators get a `failed` run and no request row. Run
+  statuses are `running`, `success` and `failed`; there is no `partial`.
+- **One value per period**: a new collection replaces the periods it brings, and `/observations/series`
+  returns one row per period -- the latest collection's; within one collection, the largest value.
+- **Timestamps**: timezone-aware UTC everywhere (`app/utils/time.py`).
+- **Refresh**: each stale country is replayed with every indicator from all of its successful runs, over
+  the Core's window (`years_back` = 10: from ten years ago to this year); it counts as refreshed only when
+  every indicator got an answer.
 
 ## Database
 
@@ -263,7 +281,7 @@ responses are never overwritten; each call generates new history.
 | Table | Purpose |
 |---|---|
 | `ingestion_runs` | One row per indicator collected (status, timing, request payload) |
-| `undata_requests` | Each call made to the portal |
+| `undata_requests` | One row per (country, indicator) the portal answered -- the checks |
 | `raw_api_responses` | Raw JSON responses |
 | `undata_dataflows` | Registered dataflow metadata |
 | `undata_datastructures` | Registered dimensions/codes |

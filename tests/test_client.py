@@ -4,7 +4,12 @@ import httpx
 import pytest
 
 from app.clients.undata_client import UNDataClient
-from app.core.exceptions import UNDataClientError, UNDataTimeoutError, UNDataTransientError
+from app.core.exceptions import (
+    UNDataClientError,
+    UNDataEmptyResponseError,
+    UNDataTimeoutError,
+    UNDataTransientError,
+)
 
 
 MOCK_INDICATORS = [{"id": 49, "name": "Total population by sex", "shortName": "TPopulation"}]
@@ -84,7 +89,6 @@ class TestUNDataClient:
 
         client = UNDataClient()
         client._retries = 1
-        client._backoff = 0
         with pytest.raises(UNDataTimeoutError):
             client.get_indicators()
 
@@ -92,10 +96,7 @@ class TestUNDataClient:
     def test_http_error_raises(self, mock_client_class: MagicMock) -> None:
         # 4xx is a non-retryable client error.
         mock_response = MagicMock()
-        mock_response.status_code = 404
-        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
-            "Error", request=MagicMock(), response=mock_response
-        )
+        mock_response.status_code = 400
         mock_client = MagicMock()
         mock_client.get.return_value = mock_response
         mock_client.__enter__ = MagicMock(return_value=mock_client)
@@ -103,10 +104,49 @@ class TestUNDataClient:
         mock_client_class.return_value = mock_client
 
         client = UNDataClient()
-        client._retries = 1
-        client._backoff = 0
         with pytest.raises(UNDataClientError):
             client.get_indicators()
+        assert mock_client.get.call_count == 1
+
+    @patch("app.clients.undata_client.httpx.Client")
+    def test_a_404_is_the_source_saying_it_has_no_data(self, mock_client_class: MagicMock) -> None:
+        mock_response = MagicMock()
+        mock_response.status_code = 404
+        mock_client = MagicMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_class.return_value = mock_client
+
+        with pytest.raises(UNDataEmptyResponseError):
+            UNDataClient().get_indicators()
+
+    @patch("app.clients.undata_client.httpx.Client")
+    def test_a_429_is_retried(self, mock_client_class: MagicMock) -> None:
+        """Até 26/10/2026 este cliente não repetia 429; agora segue a mesma
+        política dos outros coletores (app/utils/retry.py)."""
+        limitado = MagicMock(status_code=429, headers={"Retry-After": "0"})
+        ok = MagicMock(status_code=200)
+        ok.json.return_value = MOCK_INDICATORS
+        mock_client = MagicMock()
+        mock_client.get.side_effect = [limitado, ok]
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_class.return_value = mock_client
+
+        assert UNDataClient().get_indicators() == MOCK_INDICATORS
+
+    @patch("app.clients.undata_client.httpx.Client")
+    def test_a_network_error_is_retried(self, mock_client_class: MagicMock) -> None:
+        ok = MagicMock(status_code=200)
+        ok.json.return_value = MOCK_INDICATORS
+        mock_client = MagicMock()
+        mock_client.get.side_effect = [httpx.ConnectError("dns"), ok]
+        mock_client.__enter__ = MagicMock(return_value=mock_client)
+        mock_client.__exit__ = MagicMock(return_value=False)
+        mock_client_class.return_value = mock_client
+
+        assert UNDataClient().get_indicators() == MOCK_INDICATORS
 
     @patch("app.clients.undata_client.httpx.Client")
     def test_server_error_raises_transient(self, mock_client_class: MagicMock) -> None:
@@ -124,7 +164,6 @@ class TestUNDataClient:
 
         client = UNDataClient()
         client._retries = 3
-        client._backoff = 0
         with pytest.raises(UNDataTransientError):
             client.get_indicators()
 
@@ -209,21 +248,34 @@ class TestSerieToleraAnoQueFalha:
 
 
 class TestBackoffExponencial:
-    def test_dobra_a_cada_tentativa_com_jitter(self) -> None:
+    """A espera é a política comum aos quatro coletores (app/utils/retry.py),
+    que herdou daqui a progressão exponencial com jitter."""
+
+    def test_dobra_a_cada_tentativa_com_jitter(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """O backoff linear (2s, 4s, 6s) some contra indisponibilidade real: em
         25/08/2026 o portal ficou 29 minutos fora e as 3 tentativas de cada
         requisição se esgotavam em ~6 segundos, sempre dentro da janela ruim."""
-        client = UNDataClient()
-        base = client._backoff
+        from app.core.config import settings
+        from app.utils.retry import backoff_seconds
 
-        for tentativa, esperado in ((1, base), (2, base * 2), (3, base * 4)):
-            espera = client._espera(tentativa)
+        monkeypatch.setattr(settings, "default_backoff", 2)
+        for tentativa, esperado in ((1, 2), (2, 4), (3, 8)):
+            espera = backoff_seconds(tentativa)
             assert esperado <= espera <= esperado * 1.25
 
-    def test_jitter_separa_requisicoes_que_sairam_em_rajada(self) -> None:
+    def test_jitter_separa_requisicoes_que_sairam_em_rajada(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Uma coleta são 11 anos × N indicadores saindo juntos. Sem jitter,
         todos repetem no mesmo instante e batem de novo juntos numa fonte que já
         está sobrecarregada."""
-        client = UNDataClient()
-        esperas = {client._espera(2) for _ in range(20)}
+        from app.core.config import settings
+        from app.utils.retry import backoff_seconds
+
+        monkeypatch.setattr(settings, "default_backoff", 2)
+        esperas = {backoff_seconds(2) for _ in range(20)}
         assert len(esperas) > 1, "a espera não pode ser idêntica para todos"
+
+    def test_retry_after_e_obedecido_ate_o_teto(self) -> None:
+        from app.utils.retry import MAX_BACKOFF_SECONDS, backoff_seconds
+
+        assert backoff_seconds(1, "7") == 7
+        assert backoff_seconds(1, "3600") == MAX_BACKOFF_SECONDS

@@ -27,7 +27,7 @@ def test_a_recent_check_is_not_stale(mock_session: MagicMock) -> None:
 
 
 def test_an_old_check_is_stale(mock_session: MagicMock) -> None:
-    service = _service(mock_session, checks={("ESP", _POP): utc_now() - timedelta(days=31)})
+    service = _service(mock_session, checks={("ESP", _POP): utc_now() - timedelta(days=91)})
 
     items = service.get_freshness(countries=["ESP"], indicators=[_POP]).data["items"]
 
@@ -79,7 +79,7 @@ def test_a_check_that_returned_nothing_still_counts_as_checked(mock_session: Mag
 def test_only_stale_filters_out_what_is_fresh(mock_session: MagicMock) -> None:
     service = _service(
         mock_session,
-        checks={("ESP", _POP): utc_now() - timedelta(days=1), ("ESP", _URB): utc_now() - timedelta(days=90)},
+        checks={("ESP", _POP): utc_now() - timedelta(days=1), ("ESP", _URB): utc_now() - timedelta(days=91)},
     )
 
     items = service.get_freshness(countries=["ESP"], indicators=[_POP, _URB], only_stale=True).data["items"]
@@ -115,3 +115,15 @@ def test_the_envelope_reports_what_was_asked(mock_session: MagicMock) -> None:
     assert response.metadata.endpoint == "freshness"
     assert response.metadata.stored is False
     assert response.metadata.records == 1
+
+
+def test_the_default_window_is_the_cores_ninety_days(mock_session: MagicMock) -> None:
+    """Indicador de país sai uma vez por ano; o Core o considera bom por 90 dias
+    (`country_indicator_ttl_days`). Com o padrão antigo de 30, quem não passava
+    a janela renovava todo mês um número que não tinha mudado."""
+    service = _service(mock_session, checks={("ESP", _POP): utc_now() - timedelta(days=60)})
+
+    response = service.get_freshness(countries=["ESP"], indicators=[_POP])
+
+    assert response.data["stale_after_days"] == 90
+    assert response.data["items"][0]["stale"] is False
