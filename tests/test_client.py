@@ -11,7 +11,6 @@ from app.core.exceptions import (
     UNDataTransientError,
 )
 
-
 MOCK_INDICATORS = [{"id": 49, "name": "Total population by sex", "shortName": "TPopulation"}]
 MOCK_LOCATIONS = [{"id": 724, "name": "Spain", "iso3": "ESP", "iso2": "ES"}]
 MOCK_DATA = [
